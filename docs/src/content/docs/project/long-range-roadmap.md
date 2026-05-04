@@ -5,7 +5,7 @@ description: Unexercised surfaces, known gaps, and long-term project tracks.
 
 Last reviewed: May 4, 2026.
 
-This page tracks what has not yet been run through its paces and what has been identified during dogfood work but needs a durable owner. It complements the milestone [Roadmap](/project/roadmap/), [Container Security Research](/project/container-security-research/), and [Runtime Matrix](/project/runtime-matrix/).
+This page tracks what has not yet been run through its paces and what has been identified during dogfood work but needs a durable owner. It complements the milestone [Roadmap](/project/roadmap/), [Container Security Research](/project/container-security-research/), [Runtime Matrix](/project/runtime-matrix/), and [Agent Ecosystem Spikes](/project/agent-ecosystem-spikes/).
 
 ## Current State
 
@@ -27,6 +27,8 @@ What has not been exercised enough:
 - Docs build as a release gate.
 - Real multi-agent workloads beyond Codex.
 - VCS/GitHub publish authority as a first-class policy surface.
+- OpenTelemetry/OpenInference-compatible agent telemetry.
+- Agent Skills packaging, locking, provenance, and capability enforcement.
 
 ## M5 Exit Criteria
 
@@ -52,6 +54,8 @@ M5 should not exit until the project can say:
 | Credential isolation | Keep secrets out of ambient agent state. | Rust-side `SECRET_ACLS` re-derivation from signed policy, PID 1 env audit, Codex auth/session broker, file descriptor passing, mmap, `/proc/<pid>/mem`, already-read secret caching. |
 | VCS and publish authority | Gate repository mutation independently from shell/network access. | Discussion [#24](https://github.com/kubedoll-heavy-industries/agentcontainers/discussions/24): GitHub CLI auth, credential helpers, SSH agent sockets, `git push`, `gh api`, releases, workflows, packages. |
 | Supply chain | Make agent environments reproducible and revocable. | TUF key rotation/revocation, reproducible builds, component introspection, OCI org policy lock redesign, release provenance verification in CI. |
+| Telemetry | Make agent and enforcer telemetry useful without leaking prompts, secrets, or canaries. | OpenTelemetry GenAI, OpenInference, OpenAI Agents SDK tracing, OTLP exporters, redaction defaults, telemetry egress policy. |
+| Skills packaging | Treat Agent Skills as signed, policy-bearing supply chain components. | Skill manifests, OCI packing/referrers, SBOM/provenance, capability manifests, skill lockfile entries, MCP registry linkage. |
 | WASM/MCP tool host | Treat tools as untrusted supply chain components. | WASM memory/time limits, async WASI support, process isolation for WASM execution, MCP registry trust model, signed tool manifests, capability manifests. |
 | Kubernetes production | Make cluster deployments first-class. | RuntimeClass profiles, Pod Security, service-account automount policy, hostPath denial, node OS differences, Talos system extensions, enforcer DaemonSet/sidecar model. |
 | Developer ecosystem | Make common agent workflows ergonomic without weakening policy. | Claude Code, Aider, Goose, OpenCode, Codex variants, nested Docker/buildkit, devcontainer compatibility, VS Code extension. |
@@ -65,6 +69,8 @@ M5 should not exit until the project can say:
 - Add `network-canary` with a local callback sink and a fake metadata endpoint.
 - Add `metadata-min` to inventory mountinfo, `/proc`, `/sys`, cgroups, hostname, env, namespace links, and agent-local auth/session files.
 - Add `vcs-publish` to prove authenticated GitHub/credential-helper publish paths are denied without explicit approval.
+- Add telemetry spike outputs: proposed `agent.telemetry` schema, OTLP collector fixture, and redaction defaults.
+- Add skills spike outputs: skill compatibility table and draft skill package/lockfile manifest.
 - Run privileged enforcer tests in a documented Linux environment and publish the exact kernel/runtime versions tested.
 - Pin docs dependencies and add docs build verification.
 
@@ -76,6 +82,8 @@ M5 should not exit until the project can say:
 - Implement process-policy features currently rejected as not implemented: `denyEnv`, script validation, and argument-aware interpreter controls.
 - Complete deny-path propagation into BPF maps and add filesystem regression tests for deny precedence.
 - Add TUF key rotation/revocation workflow and org-policy lockfile redesign.
+- Add skill and MCP registry entries to lockfile/provenance verification.
+- Export enforcer/audit events as OTel-compatible spans or events with redacted attributes.
 
 ### Production
 
@@ -83,6 +91,7 @@ M5 should not exit until the project can say:
 - Provide a high-isolation backend for untrusted agents with microVM isolation and clear performance/compatibility tradeoffs.
 - Move agent auth/session handling toward brokered credentials instead of long-lived same-user files.
 - Make release artifacts reproducible or independently verifiable from source.
+- Publish a signed skill/MCP packaging profile with SBOMs, provenance, and capability manifests.
 - Publish a conformance suite for agent-safe container behavior.
 - Establish an external security review and red-team process once regressions are reproducible.
 
@@ -100,6 +109,9 @@ These came from scans, dogfood notes, and discussions and should either become i
 - WASM `memory_bytes` and `timeout_ms` limits are not enforced yet.
 - WASI async types are not supported.
 - `component` introspection is not available yet.
+- OTel GenAI conventions are still development-status; telemetry support must tolerate schema churn.
+- Agent Skills are portable filesystem packages, but they do not solve signing, trust, or runtime enforcement by themselves.
+- MCP Registry is preview metadata, not a package registry or scanner; package code still lives in npm/PyPI/NuGet/OCI/etc.
 - Org policy locking needs redesign.
 - JSONC comment preservation during `update` is still a known limitation.
 - `scriptValidation` and `denyEnv` are schema-visible but not implemented.

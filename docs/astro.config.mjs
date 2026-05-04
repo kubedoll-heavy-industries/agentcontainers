@@ -54,6 +54,7 @@ export default defineConfig({
           items: [
             { label: 'Roadmap', slug: 'project/roadmap' },
             { label: 'Long-Range Roadmap', slug: 'project/long-range-roadmap' },
+            { label: 'Agent Ecosystem Spikes', slug: 'project/agent-ecosystem-spikes' },
             { label: 'Container Security Research', slug: 'project/container-security-research' },
             { label: 'Runtime Matrix', slug: 'project/runtime-matrix' },
             { label: 'Contributing', slug: 'project/contributing' },
