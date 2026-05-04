@@ -93,7 +93,7 @@ func runLock(cmd *cobra.Command, configPath, outputPath string) error {
 	now := time.Now().UTC()
 
 	lf := &config.Lockfile{
-		Version:     1,
+		Version:     2,
 		GeneratedAt: now,
 		GeneratedBy: "agentcontainer",
 		Resolved:    config.ResolvedArtifacts{},

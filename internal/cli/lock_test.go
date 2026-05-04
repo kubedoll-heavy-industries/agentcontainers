@@ -88,8 +88,11 @@ func TestLockCreatesLockfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseLockfile() error: %v", err)
 	}
-	if lf.Version != 1 {
-		t.Errorf("lockfile Version = %d, want 1", lf.Version)
+	if lf.Version != 2 {
+		t.Errorf("lockfile Version = %d, want 2", lf.Version)
+	}
+	if err := lf.Validate(); err != nil {
+		t.Fatalf("generated lockfile should validate: %v", err)
 	}
 	if lf.Resolved.Image == nil {
 		t.Error("lockfile should have an image entry")
