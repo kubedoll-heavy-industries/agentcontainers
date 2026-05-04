@@ -228,6 +228,12 @@ type PolicyConfig struct {
 // ProvenanceConfig declares supply chain verification requirements.
 type ProvenanceConfig struct {
 	Require *ProvenanceRequirements `json:"require,omitempty"`
+	Policy  *PolicyChannelConfig    `json:"policy,omitempty"`
+}
+
+// PolicyChannelConfig points at the org-controlled mutable OCI policy channel.
+type PolicyChannelConfig struct {
+	Ref string `json:"ref"`
 }
 
 // ProvenanceRequirements specifies what must be verified before a session starts.
@@ -321,10 +327,17 @@ func (c *AgentContainer) Validate() error {
 				errs = append(errs, fmt.Errorf("agent.policy.maxConcurrentTools: must be >= 0, got %d", p.MaxConcurrentTools))
 			}
 		}
-		if c.Agent.Provenance != nil && c.Agent.Provenance.Require != nil {
-			req := c.Agent.Provenance.Require
-			if req.SLSALevel < 0 || req.SLSALevel > 4 {
-				errs = append(errs, fmt.Errorf("agent.provenance.require.slsaLevel: must be 0-4, got %d", req.SLSALevel))
+		if c.Agent.Provenance != nil {
+			if c.Agent.Provenance.Require != nil {
+				req := c.Agent.Provenance.Require
+				if req.SLSALevel < 0 || req.SLSALevel > 4 {
+					errs = append(errs, fmt.Errorf("agent.provenance.require.slsaLevel: must be 0-4, got %d", req.SLSALevel))
+				}
+			}
+			if c.Agent.Provenance.Policy != nil {
+				if strings.TrimSpace(c.Agent.Provenance.Policy.Ref) == "" {
+					errs = append(errs, errors.New("agent.provenance.policy.ref: must not be empty"))
+				}
 			}
 		}
 		// Note: c.Agent.Enforcer is validated at runtime — OCI image parse

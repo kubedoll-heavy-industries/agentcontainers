@@ -162,6 +162,10 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		return fmt.Errorf("run: invalid configuration: %w", err)
 	}
 
+	if err := verifyRunPolicyChannel(cmd.Context(), cfg, cfgPath, newOCIResolver()); err != nil {
+		return err
+	}
+
 	// 1b. Extract org policy from the image manifest and validate against
 	// workspace config. Policy is embedded in the image as a typed layer at
 	// build time (PRD-017). If no policy layer is found, DefaultPolicy() is
@@ -476,6 +480,48 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// (Sandbox runtime manages its own sidecar teardown in Stop().)
 	if !isSandbox && sidecarHandle != nil && sidecarHandle.Managed {
 		stopManagedSidecar(out, sidecarHandle)
+	}
+
+	return nil
+}
+
+func verifyRunPolicyChannel(ctx context.Context, cfg *config.AgentContainer, cfgPath string, fetcher policyBundleFetcher) error {
+	policyRef := configuredPolicyRef(cfg)
+	if policyRef == "" {
+		return nil
+	}
+	if cfgPath == "" {
+		return fmt.Errorf("run: mutable policy channel: config path is required")
+	}
+
+	lf, err := config.LoadLockfile(filepath.Dir(cfgPath))
+	if err != nil {
+		return fmt.Errorf("run: mutable policy channel: loading lockfile: %w", err)
+	}
+	if err := lf.Validate(); err != nil {
+		return fmt.Errorf("run: mutable policy channel: invalid lockfile: %w", err)
+	}
+	if lf.Resolved.Policy == nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s is not pinned in lockfile", policyRef)
+	}
+	if cfg.Image != "" && lf.Resolved.Image == nil {
+		return fmt.Errorf("run: mutable policy channel: image %s is not pinned in lockfile", cfg.Image)
+	}
+
+	now := time.Now().UTC()
+	_, bundle, err := resolvePolicyChannel(ctx, fetcher, policyRef, now)
+	if err != nil {
+		return fmt.Errorf("run: mutable policy channel: fetching policy %s: %w", policyRef, err)
+	}
+	if err := checkPolicyRollback(lf.Resolved.Policy, bundle); err != nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s: %w", policyRef, err)
+	}
+	if issues := evaluatePolicyChannelArtifacts(cfg, lf, bundle, now); len(issues) > 0 {
+		var msgs []string
+		for _, issue := range issues {
+			msgs = append(msgs, fmt.Sprintf("%s: %v", issue.label, issue.err))
+		}
+		return fmt.Errorf("run: mutable policy channel denied artifact(s): %s", strings.Join(msgs, "; "))
 	}
 
 	return nil

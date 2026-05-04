@@ -676,6 +676,31 @@ func TestValidate(t *testing.T) {
 			},
 		},
 		{
+			name: "accepts valid provenance policy channel",
+			cfg: AgentContainer{
+				Name:  "test",
+				Image: "alpine:3",
+				Agent: &AgentConfig{
+					Provenance: &ProvenanceConfig{
+						Policy: &PolicyChannelConfig{Ref: "ghcr.io/acme/agentcontainers-policy:prod"},
+					},
+				},
+			},
+		},
+		{
+			name: "rejects empty provenance policy ref",
+			cfg: AgentContainer{
+				Name:  "test",
+				Image: "alpine:3",
+				Agent: &AgentConfig{
+					Provenance: &ProvenanceConfig{
+						Policy: &PolicyChannelConfig{Ref: " \t "},
+					},
+				},
+			},
+			wantErr: "agent.provenance.policy.ref: must not be empty",
+		},
+		{
 			name: "rejects invalid slsaLevel",
 			cfg: AgentContainer{
 				Name:  "test",

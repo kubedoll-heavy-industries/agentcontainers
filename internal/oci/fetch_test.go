@@ -328,6 +328,178 @@ func TestFetchPolicy_DigestMismatch(t *testing.T) {
 	}
 }
 
+func TestFetchPolicyBundle_TagRefSuccess(t *testing.T) {
+	bundleJSON := `{"version":1,"policies":[{"name":"default"}]}`
+	bundleDigest := policyDigestOf(bundleJSON)
+	manifestDigest := "sha256:" + strings.Repeat("1", 64)
+
+	manifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{
+				MediaType: PolicyBundleArtifactMediaType,
+				Digest:    bundleDigest,
+				Size:      int64(len(bundleJSON)),
+			},
+		},
+	}
+
+	var fetchedByDigest bool
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/manifests/latest"):
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest):
+			fetchedByDigest = true
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_ = json.NewEncoder(w).Encode(manifest)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/"+bundleDigest):
+			_, _ = w.Write([]byte(bundleJSON))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	resolver := NewResolver(WithHTTPClient(srv.Client()))
+	ref := srv.Listener.Addr().String() + "/myorg/policy-bundle:latest"
+
+	data, gotDigest, err := resolver.FetchPolicyBundle(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("FetchPolicyBundle() error = %v", err)
+	}
+	if string(data) != bundleJSON {
+		t.Errorf("FetchPolicyBundle() data = %q, want %q", string(data), bundleJSON)
+	}
+	if gotDigest != manifestDigest {
+		t.Errorf("FetchPolicyBundle() digest = %q, want %q", gotDigest, manifestDigest)
+	}
+	if !fetchedByDigest {
+		t.Error("FetchPolicyBundle() did not fetch manifest by resolved digest")
+	}
+}
+
+func TestFetchPolicyBundle_DigestPinnedRefSuccess(t *testing.T) {
+	bundleJSON := `{"version":1,"policies":[{"name":"pinned"}]}`
+	bundleDigest := policyDigestOf(bundleJSON)
+	manifestDigest := "sha256:" + strings.Repeat("2", 64)
+
+	manifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{
+				MediaType: PolicyBundleArtifactMediaType,
+				Digest:    bundleDigest,
+				Size:      int64(len(bundleJSON)),
+			},
+		},
+	}
+
+	var sawHead bool
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			sawHead = true
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest):
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_ = json.NewEncoder(w).Encode(manifest)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/"+bundleDigest):
+			_, _ = w.Write([]byte(bundleJSON))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	resolver := NewResolver(WithHTTPClient(srv.Client()))
+	ref := srv.Listener.Addr().String() + "/myorg/policy-bundle@" + manifestDigest
+
+	data, gotDigest, err := resolver.FetchPolicyBundle(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("FetchPolicyBundle() error = %v", err)
+	}
+	if string(data) != bundleJSON {
+		t.Errorf("FetchPolicyBundle() data = %q, want %q", string(data), bundleJSON)
+	}
+	if gotDigest != manifestDigest {
+		t.Errorf("FetchPolicyBundle() digest = %q, want %q", gotDigest, manifestDigest)
+	}
+	if sawHead {
+		t.Error("FetchPolicyBundle() issued HEAD for digest-pinned reference")
+	}
+}
+
+func TestFetchPolicyBundle_EmbeddedOrgPolicyLayerDoesNotMatch(t *testing.T) {
+	policyJSON := `{"requireSignatures":true}`
+	policyDigest := policyDigestOf(policyJSON)
+	manifestDigest := "sha256:" + strings.Repeat("3", 64)
+
+	manifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{
+				MediaType: PolicyArtifactMediaType,
+				Digest:    policyDigest,
+				Size:      int64(len(policyJSON)),
+			},
+		},
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest) {
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_ = json.NewEncoder(w).Encode(manifest)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	resolver := NewResolver(WithHTTPClient(srv.Client()))
+	ref := srv.Listener.Addr().String() + "/myorg/policy-bundle@" + manifestDigest
+
+	_, _, err := resolver.FetchPolicyBundle(context.Background(), ref)
+	if err == nil {
+		t.Fatal("FetchPolicyBundle() error = nil, want error for embedded orgpolicy-only manifest")
+	}
+	if !strings.Contains(err.Error(), "no policy bundle layer found") {
+		t.Errorf("error = %q, want it to contain 'no policy bundle layer found'", err.Error())
+	}
+}
+
+func TestFetchPolicyBundle_MissingBundleLayer(t *testing.T) {
+	manifestDigest := "sha256:" + strings.Repeat("4", 64)
+	manifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Digest: "sha256:" + strings.Repeat("a", 64), Size: 10},
+		},
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest) {
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_ = json.NewEncoder(w).Encode(manifest)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	resolver := NewResolver(WithHTTPClient(srv.Client()))
+	ref := srv.Listener.Addr().String() + "/myorg/policy-bundle@" + manifestDigest
+
+	_, _, err := resolver.FetchPolicyBundle(context.Background(), ref)
+	if err == nil {
+		t.Fatal("FetchPolicyBundle() error = nil, want error for missing bundle layer")
+	}
+	if !strings.Contains(err.Error(), "no policy bundle layer found") {
+		t.Errorf("error = %q, want it to contain 'no policy bundle layer found'", err.Error())
+	}
+}
+
 func TestFindPolicyLayer(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -421,7 +593,6 @@ func signDescriptorAnnotation(t *testing.T, priv ed25519.PrivateKey, desc ociDes
 func keyMap(pub ed25519.PublicKey) map[string]ed25519.PublicKey {
 	return map[string]ed25519.PublicKey{OrgKeyID(pub): pub}
 }
-
 
 // TestFindPolicyLayer_OrgSignerSkipsUnsigned verifies that when an org signing
 // key is configured, policy layers without the annotation are silently skipped

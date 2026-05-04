@@ -160,10 +160,14 @@ func runLock(cmd *cobra.Command, configPath, outputPath string) error {
 		}
 	}
 
-	// TODO: Org policy locking needs redesign. The policy is resolved from
-	// the workspace hierarchy (not from config), so agentcontainer lock needs a way to
-	// discover and pin the org policy OCI ref. This likely involves reading
-	// .agentcontainers/policy.json metadata or a dedicated policy registry.
+	if policyRef := configuredPolicyRef(cfg); policyRef != "" {
+		resolvedPolicy, _, err := resolvePolicyChannel(ctx, resolver, policyRef, now)
+		if err != nil {
+			return fmt.Errorf("lock: resolving policy %s: %w", policyRef, err)
+		}
+		lf.Resolved.Policy = resolvedPolicy
+		_, _ = fmt.Fprintf(out, "  policy: %s -> %s (epoch %d)\n", policyRef, resolvedPolicy.Digest, resolvedPolicy.Epoch)
+	}
 
 	// 4. Determine output path.
 	if outputPath == "" {

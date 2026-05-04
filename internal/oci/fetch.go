@@ -85,6 +85,10 @@ type ociDescriptor struct {
 // PolicyArtifactMediaType is the expected media type for org policy layers.
 const PolicyArtifactMediaType = "application/vnd.agentcontainers.orgpolicy.v1+json"
 
+// PolicyBundleArtifactMediaType is the expected media type for mutable policy
+// bundle layers.
+const PolicyBundleArtifactMediaType = "application/vnd.agentcontainers.policy.v1+json"
+
 // maxPolicySize is the maximum allowed policy artifact size (1 MiB).
 const maxPolicySize = 1 << 20
 
@@ -115,6 +119,44 @@ func (r *Resolver) FetchPolicy(ctx context.Context, imageRef string) ([]byte, er
 	}
 
 	return data, nil
+}
+
+// FetchPolicyBundle fetches a mutable policy bundle artifact and returns the
+// raw bytes of the first policy bundle layer plus the resolved manifest digest.
+func (r *Resolver) FetchPolicyBundle(ctx context.Context, policyRef string) (data []byte, manifestDigest string, err error) {
+	ref, err := ParseReference(policyRef)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle: %w", err)
+	}
+
+	manifestDigest = ref.Digest
+	if manifestDigest == "" {
+		manifestDigest, err = r.resolveTag(ctx, ref)
+		if err != nil {
+			return nil, "", fmt.Errorf("fetch policy bundle: %w", err)
+		}
+	}
+
+	digestRef := ref
+	digestRef.Tag = ""
+	digestRef.Digest = manifestDigest
+
+	manifest, err := r.fetchManifest(ctx, digestRef)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle: %w", err)
+	}
+
+	layer, err := findPolicyBundleLayer(manifest)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle %s: %w", digestRef.String(), err)
+	}
+
+	data, err = r.fetchBlob(ctx, digestRef, layer.Digest)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle %s: %w", digestRef.String(), err)
+	}
+
+	return data, manifestDigest, nil
 }
 
 // manifestAcceptHeader includes all manifest types we handle: single manifests
@@ -251,6 +293,18 @@ func (r *Resolver) resolveIndex(ctx context.Context, ref Reference, data []byte)
 		return nil, fmt.Errorf("decoding fallback manifest for %s: %w", ref.String(), err)
 	}
 	return &manifest, nil
+}
+
+func findPolicyBundleLayer(m *ociManifest) (ociDescriptor, error) {
+	if len(m.Layers) == 0 {
+		return ociDescriptor{}, fmt.Errorf("no policy bundle layer found in manifest: manifest has no layers")
+	}
+	for _, layer := range m.Layers {
+		if layer.MediaType == PolicyBundleArtifactMediaType {
+			return layer, nil
+		}
+	}
+	return ociDescriptor{}, fmt.Errorf("no policy bundle layer found in manifest")
 }
 
 // findPolicyLayer finds the effective policy layer in the manifest.
