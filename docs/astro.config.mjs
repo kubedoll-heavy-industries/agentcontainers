@@ -53,6 +53,7 @@ export default defineConfig({
           label: 'Project',
           items: [
             { label: 'Roadmap', slug: 'project/roadmap' },
+            { label: 'Long-Range Roadmap', slug: 'project/long-range-roadmap' },
             { label: 'Container Security Research', slug: 'project/container-security-research' },
             { label: 'Runtime Matrix', slug: 'project/runtime-matrix' },
             { label: 'Contributing', slug: 'project/contributing' },

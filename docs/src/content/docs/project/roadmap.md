@@ -51,7 +51,7 @@ Hardening the runtime against contemporary container escape classes and making d
 - **M5-EBPF**: enforcer privilege minimization, BPF/perf denial from the agent container, and sidecar TCB review
 - **M5-DOCS**: publish the threat model, research baseline, known limitations, and tested runtime matrix
 
-See [Container Security Research](/project/container-security-research/) for the threat taxonomy and [Runtime Matrix](/project/runtime-matrix/) for backend/profile comparison.
+See [Container Security Research](/project/container-security-research/) for the threat taxonomy, [Runtime Matrix](/project/runtime-matrix/) for backend/profile comparison, and [Long-Range Roadmap](/project/long-range-roadmap/) for unexercised surfaces and future tracks.
 
 ### M6: Ecosystem
 
