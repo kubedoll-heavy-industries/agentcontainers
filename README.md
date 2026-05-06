@@ -18,7 +18,7 @@ Persistent AI agents require broad, long-lived system permissions. They read and
 | Threat | Mechanism |
 |--------|-----------|
 | Unapproved binary execution | Default-deny approval broker + eBPF enforcer |
-| Argument injection / subshell escapes | Approval broker, generated seccomp profile, and eBPF sidecar checks; additional layers are planned |
+| Argument injection / subshell escapes | Approval broker blocks known interpreter escape patterns; generated seccomp and eBPF sidecar layers add runtime checks |
 | File access outside declared paths | Read-only root FS, explicit bind mounts |
 | Network exfiltration | cgroup-scoped BPF connect4/sendmsg hooks |
 | Credential theft | Secrets injected via tmpfs at `/run/secrets`; never in env vars |
