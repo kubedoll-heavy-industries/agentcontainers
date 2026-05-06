@@ -9,11 +9,12 @@ import (
 	"strings"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/container"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/secrets"
-	"go.uber.org/zap"
 )
 
 func TestExecFlagParsing(t *testing.T) {

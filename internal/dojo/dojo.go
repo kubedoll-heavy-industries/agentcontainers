@@ -287,10 +287,6 @@ func prepareRoot(base, profile string) (string, error) {
 	return os.MkdirTemp("", "ac-"+profile+"-")
 }
 
-func writeCodexRedteamConfig(path, name, image, enforcerImage string) error {
-	return writeDojoConfig(path, name, ProfileCodexRedteam, image, enforcerImage)
-}
-
 func writeDojoConfig(path, name, profile, image, enforcerImage string) error {
 	secrets := map[string]secretConfig(nil)
 	if os.Getenv("OPENAI_API_KEY") != "" {
@@ -508,39 +504,39 @@ func workspaceReadme(profile string) string {
 }
 
 func printReport(out io.Writer, result *Result, output string) {
-	fmt.Fprintf(out, "agentcontainer dojo profile prepared: %s\n", result.Profile)
-	fmt.Fprintln(out)
-	fmt.Fprintf(out, "Root:              %s\n", result.Root)
-	fmt.Fprintf(out, "Workspace:         %s\n", result.WorkspaceDir)
-	fmt.Fprintf(out, "Config:            %s\n", result.ConfigPath)
-	fmt.Fprintf(out, "Host canary path:  %s\n", result.HostCanaryPath)
-	fmt.Fprintf(out, "Host canary:       %s\n", result.HostCanary.Token)
-	fmt.Fprintf(out, "Workspace canary:  %s\n", result.WorkspaceCanary.Token)
-	fmt.Fprintln(out)
+	_, _ = fmt.Fprintf(out, "agentcontainer dojo profile prepared: %s\n", result.Profile)
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintf(out, "Root:              %s\n", result.Root)
+	_, _ = fmt.Fprintf(out, "Workspace:         %s\n", result.WorkspaceDir)
+	_, _ = fmt.Fprintf(out, "Config:            %s\n", result.ConfigPath)
+	_, _ = fmt.Fprintf(out, "Host canary path:  %s\n", result.HostCanaryPath)
+	_, _ = fmt.Fprintf(out, "Host canary:       %s\n", result.HostCanary.Token)
+	_, _ = fmt.Fprintf(out, "Workspace canary:  %s\n", result.WorkspaceCanary.Token)
+	_, _ = fmt.Fprintln(out)
 	if output != "" {
-		fmt.Fprintln(out, strings.TrimSpace(output))
-		fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, strings.TrimSpace(output))
+		_, _ = fmt.Fprintln(out)
 	}
 	if result.ContainerID == "" {
-		fmt.Fprintln(out, "Start command:")
-		fmt.Fprintf(out, "  %s\n\n", shellJoin(result.StartCommand))
+		_, _ = fmt.Fprintln(out, "Start command:")
+		_, _ = fmt.Fprintf(out, "  %s\n\n", shellJoin(result.StartCommand))
 	} else {
 		agentPath := result.StartCommand[0]
-		fmt.Fprintln(out, "Commands:")
-		fmt.Fprintf(out, "  Drop into chat:   %s exec -i %s --config %s -- codex '<scoped prompt>'\n", agentPath, result.ContainerID, result.ConfigPath)
-		fmt.Fprintf(out, "  Drop into shell:  %s exec -i %s --config %s -- sh -i\n", agentPath, result.ContainerID, result.ConfigPath)
-		fmt.Fprintf(out, "  Show logs:        %s logs %s\n", agentPath, result.ContainerID)
-		fmt.Fprintf(out, "  Stop container:   %s stop %s\n", agentPath, result.ContainerID)
-		fmt.Fprintf(out, "  Stop enforcer:    %s enforcer stop --force\n", agentPath)
-		fmt.Fprintf(out, "  Remove fixtures:  rm -rf %s\n", result.Root)
-		fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, "Commands:")
+		_, _ = fmt.Fprintf(out, "  Drop into chat:   %s exec -i %s --config %s -- codex '<scoped prompt>'\n", agentPath, result.ContainerID, result.ConfigPath)
+		_, _ = fmt.Fprintf(out, "  Drop into shell:  %s exec -i %s --config %s -- sh -i\n", agentPath, result.ContainerID, result.ConfigPath)
+		_, _ = fmt.Fprintf(out, "  Show logs:        %s logs %s\n", agentPath, result.ContainerID)
+		_, _ = fmt.Fprintf(out, "  Stop container:   %s stop %s\n", agentPath, result.ContainerID)
+		_, _ = fmt.Fprintf(out, "  Stop enforcer:    %s enforcer stop --force\n", agentPath)
+		_, _ = fmt.Fprintf(out, "  Remove fixtures:  rm -rf %s\n", result.Root)
+		_, _ = fmt.Fprintln(out)
 	}
 
-	fmt.Fprintln(out, "Scoped red-team prompt:")
-	fmt.Fprintln(out, "-----")
-	fmt.Fprint(out, ScopedPromptForProfile(result.Profile, result.HostCanaryPath))
-	fmt.Fprintln(out, "-----")
-	fmt.Fprintf(out, "\nGenerated at: %s\n", time.Now().Format(time.RFC3339))
+	_, _ = fmt.Fprintln(out, "Scoped red-team prompt:")
+	_, _ = fmt.Fprintln(out, "-----")
+	_, _ = fmt.Fprint(out, ScopedPromptForProfile(result.Profile, result.HostCanaryPath))
+	_, _ = fmt.Fprintln(out, "-----")
+	_, _ = fmt.Fprintf(out, "\nGenerated at: %s\n", time.Now().Format(time.RFC3339))
 }
 
 func (osCommandRunner) RunCaptured(ctx context.Context, workdir string, args ...string) (string, error) {
