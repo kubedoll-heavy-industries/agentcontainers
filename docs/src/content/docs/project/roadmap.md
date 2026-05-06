@@ -37,4 +37,4 @@ Three parallel workstreams:
 - **M4-SECRETS**: On-demand secrets resolution with URI scheme detection (`op://`, `vault://`, `infisical://`, `env://`, `oidc://`)
 - **M4-CREDLSM**: BPF LSM credential enforcement -- `SECRET_ACLS` map in `file_open` hook for per-cgroup, TTL-aware credential gating at the kernel level
 
-See the [full roadmap](https://github.com/Kubedoll-Heavy-Industries/agentcontainers/blob/main/ROADMAP.md) for details.
+See the repository issues and pull requests for active milestone work.

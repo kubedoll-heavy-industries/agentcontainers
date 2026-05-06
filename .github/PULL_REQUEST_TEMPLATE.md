@@ -9,4 +9,4 @@
 ## Checklist
 - [ ] No secrets or credentials committed
 - [ ] Tests added/updated for new functionality
-- [ ] SPEC.md updated if behavior changed
+- [ ] User-facing docs updated if behavior changed

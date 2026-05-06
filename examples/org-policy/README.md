@@ -36,7 +36,6 @@ ac run --config agentcontainer.json .
 | `trustedRegistries` | `ghcr.io/your-org/*`, `mcr.microsoft.com/devcontainers/*` | Only these registries are allowed |
 | `bannedPackages` | `event-stream@3.3.6`, `ua-parser-js@0.7.29` | Known-malicious packages rejected |
 | `allowedMCPImages` | `ghcr.io/your-org/mcp-tools/`, `ghcr.io/modelcontextprotocol/servers/` | Only approved MCP server images |
-| `maxAge` | `7d` | Locked policy must be refreshed within 7 days |
 
 ## How It Works
 
@@ -45,7 +44,7 @@ ac run --config agentcontainer.json .
 3. `agentcontainer lock` pins the policy by digest in `agentcontainer.lock`
 4. `agentcontainer run` fetches the policy, merges it with workspace config (deny wins)
 5. `agentcontainer verify` checks that all workspace artifacts comply with the policy
-6. If the locked policy is older than `maxAge`, `agentcontainer verify` flags it as stale
+6. Expired or replaced mutable policy-channel bundles fail verification until the lockfile is refreshed
 
 ## Policy Merge Rules
 
@@ -78,6 +77,6 @@ ac policy push policy.json ghcr.io/your-org/agent-policy:latest
 ## Production Notes
 
 - Pin the `orgPolicy` reference by digest for reproducibility: `ghcr.io/your-org/agent-policy@sha256:abc...`
-- Use `maxAge` to force teams to refresh stale policies
+- Use short policy-channel expirations to force teams to refresh stale policies
 - The `bannedPackages` field uses Package URL (purl) format
 - Audit compliance across all repos with `agentcontainer audit --org your-org`

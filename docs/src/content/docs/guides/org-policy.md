@@ -46,7 +46,6 @@ Create a JSON file with your organizational constraints:
     "ghcr.io/myorg/approved-tools/",
     "ghcr.io/myorg/github-mcp:v2.1.0@sha256:abc123..."
   ],
-  "maxAge": "7d",
   "maxDriftThreshold": 0.15
 }
 ```
@@ -64,7 +63,6 @@ Create a JSON file with your organizational constraints:
 | `allowedCapabilities` | string[] | Only these capabilities are permitted |
 | `deniedCapabilities` | string[] | These capabilities are explicitly blocked |
 | `allowedMCPImages` | string[] | Allowlist of MCP server images |
-| `maxAge` | string | Max age before a locked policy is stale (e.g., `"7d"`, `"72h"`) |
 
 ### MCP image allowlist matching
 
@@ -107,7 +105,7 @@ Fetches and prints the policy as JSON. Useful for inspecting remote policies.
 ac policy validate myorg-policy.json
 ```
 
-Checks the policy for internal consistency: valid SLSA levels, positive maxAge durations, well-formed allowlist patterns.
+Checks the policy for internal consistency: valid SLSA levels, supported fields, and well-formed allowlist patterns.
 
 ### Diff two policies
 
@@ -165,15 +163,20 @@ ac lock
 # Pins: image digests, MCP server digests, org policy digest + timestamp
 ```
 
-When you run `ac verify`, the policy's `maxAge` is checked:
+When you run `ac verify`, mutable org policy channels are re-resolved from the
+registry unless `--registry=false` is set. The lockfile pins the signed policy
+bundle manifest digest, epoch, and expiration time, so verification can detect
+stale or replaced policy bundles before an agent session starts:
 
 ```bash
 ac verify
-# If org policy was locked more than 7d ago (maxAge: "7d"), verification fails
-# Re-run "agentcontainer lock" to refresh the policy
+# Fails if the policy digest changed, rolled back, expired, or rejects an artifact
+# Re-run "ac lock" after approving a legitimate policy update
 ```
 
-This ensures teams cannot run with stale policies indefinitely.
+Strict offline verification still checks the locked policy expiration timestamp.
+This ensures teams cannot run with stale policies indefinitely even when registry
+access is disabled.
 
 ## Example: enterprise deployment
 
@@ -201,7 +204,6 @@ This ensures teams cannot run with stale policies indefinitely.
   "allowedMCPImages": [
     "ghcr.io/acme-corp/approved-mcp/"
   ],
-  "maxAge": "3d",
   "maxDriftThreshold": 0.1
 }
 ```
