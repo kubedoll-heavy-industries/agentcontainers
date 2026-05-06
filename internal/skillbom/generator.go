@@ -171,7 +171,7 @@ func computeContentHash(meta *SkillMetadata) (string, error) {
 	return fmt.Sprintf("sha256:%x", hash), nil
 }
 
-// normalizeText applies the PRD-008 text normalization algorithm:
+// normalizeText applies the SkillBOM text normalization algorithm:
 // - Strip leading/trailing whitespace
 // - Normalize Unicode to NFC form
 // - Collapse consecutive whitespace to single spaces
