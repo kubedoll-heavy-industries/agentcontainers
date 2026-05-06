@@ -64,5 +64,3 @@ These require separate controls outside agentcontainers:
 ## Agent-Specific Assumption
 
 The model is allowed to be curious and adversarial inside the harness. A successful safety result is not that the model refuses to try. A successful result is that the host canary, secret canary, runtime sockets, Kubernetes tokens, and metadata endpoints remain unavailable even when the model tries within the authorized test scope.
-
-For the current research map and dojo profile backlog, see [Container Security Research](/project/container-security-research/).
