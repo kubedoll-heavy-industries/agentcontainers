@@ -141,7 +141,7 @@ func (r *Resolver) FetchPolicyBundle(ctx context.Context, policyRef string) (dat
 	digestRef.Tag = ""
 	digestRef.Digest = manifestDigest
 
-	manifest, err := r.fetchManifest(ctx, digestRef)
+	manifest, err := r.fetchManifestVerified(ctx, digestRef)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch policy bundle: %w", err)
 	}
@@ -172,7 +172,7 @@ var manifestAcceptTypes = strings.Join([]string{
 // If the reference resolves to a manifest list (image index), the list is
 // resolved to the platform-specific manifest for the current GOOS/GOARCH.
 func (r *Resolver) fetchManifest(ctx context.Context, ref Reference) (*ociManifest, error) {
-	body, contentType, err := r.fetchManifestRaw(ctx, ref)
+	body, contentType, _, err := r.fetchManifestRaw(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -196,8 +196,43 @@ func (r *Resolver) fetchManifest(ctx context.Context, ref Reference) (*ociManife
 	return &m, nil
 }
 
-// fetchManifestRaw fetches the raw manifest bytes and content type for a reference.
-func (r *Resolver) fetchManifestRaw(ctx context.Context, ref Reference) ([]byte, string, error) {
+// fetchManifestVerified fetches and parses a manifest by digest, verifying the
+// raw manifest body against the digest reference before it is trusted.
+func (r *Resolver) fetchManifestVerified(ctx context.Context, ref Reference) (*ociManifest, error) {
+	if ref.Digest == "" {
+		return nil, fmt.Errorf("verified manifest fetch requires digest reference for %s", ref.String())
+	}
+
+	body, contentType, contentDigest, err := r.fetchManifestRaw(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyManifestDigest(body, ref.Digest, contentDigest); err != nil {
+		return nil, fmt.Errorf("manifest integrity check failed for %s: %w", ref.String(), err)
+	}
+
+	// Check if the response is a manifest list / image index.
+	if isIndexMediaType(contentType) {
+		return r.resolveIndex(ctx, ref, body)
+	}
+
+	var m ociManifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decoding manifest for %s: %w", ref.String(), err)
+	}
+
+	// The response might be an index even if Content-Type doesn't say so.
+	// Check the parsed mediaType field as a fallback.
+	if isIndexMediaType(m.MediaType) {
+		return r.resolveIndex(ctx, ref, body)
+	}
+
+	return &m, nil
+}
+
+// fetchManifestRaw fetches the raw manifest bytes, content type, and registry
+// content digest for a reference.
+func (r *Resolver) fetchManifestRaw(ctx context.Context, ref Reference) ([]byte, string, string, error) {
 	scheme := "https"
 	tagOrDigest := ref.Tag
 	if ref.Digest != "" {
@@ -208,32 +243,32 @@ func (r *Resolver) fetchManifestRaw(ctx context.Context, ref Reference) ([]byte,
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("creating manifest request: %w", err)
+		return nil, "", "", fmt.Errorf("creating manifest request: %w", err)
 	}
 
 	req.Header.Set("Accept", manifestAcceptTypes)
 
 	resp, err := r.doWithAuth(ctx, req, ref)
 	if err != nil {
-		return nil, "", fmt.Errorf("fetching manifest for %s: %w", ref.String(), err)
+		return nil, "", "", fmt.Errorf("fetching manifest for %s: %w", ref.String(), err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, "", fmt.Errorf("manifest not found for %s", ref.String())
+		return nil, "", "", fmt.Errorf("manifest not found for %s", ref.String())
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, "", fmt.Errorf("unexpected status %d fetching manifest for %s: %s",
+		return nil, "", "", fmt.Errorf("unexpected status %d fetching manifest for %s: %s",
 			resp.StatusCode, ref.String(), string(respBody))
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicySize))
 	if err != nil {
-		return nil, "", fmt.Errorf("reading manifest for %s: %w", ref.String(), err)
+		return nil, "", "", fmt.Errorf("reading manifest for %s: %w", ref.String(), err)
 	}
 
-	return data, resp.Header.Get("Content-Type"), nil
+	return data, resp.Header.Get("Content-Type"), resp.Header.Get("Docker-Content-Digest"), nil
 }
 
 // isIndexMediaType returns true if the media type indicates a manifest list.
@@ -267,7 +302,7 @@ func (r *Resolver) resolveIndex(ctx context.Context, ref Reference, data []byte)
 			digestRef := ref
 			digestRef.Tag = ""
 			digestRef.Digest = m.Digest
-			body, _, err := r.fetchManifestRaw(ctx, digestRef)
+			body, _, _, err := r.fetchManifestRaw(ctx, digestRef)
 			if err != nil {
 				return nil, fmt.Errorf("fetching platform manifest for %s: %w", ref.String(), err)
 			}
@@ -284,7 +319,7 @@ func (r *Resolver) resolveIndex(ctx context.Context, ref Reference, data []byte)
 	digestRef := ref
 	digestRef.Tag = ""
 	digestRef.Digest = first.Digest
-	body, _, err := r.fetchManifestRaw(ctx, digestRef)
+	body, _, _, err := r.fetchManifestRaw(ctx, digestRef)
 	if err != nil {
 		return nil, fmt.Errorf("fetching fallback manifest for %s: %w", ref.String(), err)
 	}
@@ -449,7 +484,20 @@ func verifyDigest(data []byte, expected string) error {
 	h := sha256.Sum256(data)
 	got := hex.EncodeToString(h[:])
 	if got != want {
-		return fmt.Errorf("digest mismatch: manifest says %q but blob hashes to sha256:%s", expected, got)
+		return fmt.Errorf("digest mismatch: expected %q but content hashes to sha256:%s", expected, got)
+	}
+	return nil
+}
+
+// verifyManifestDigest binds fetched raw manifest bytes to the digest used to
+// fetch them. If the registry also returned Docker-Content-Digest on the GET,
+// require it to agree with the expected digest before hashing the body.
+func verifyManifestDigest(data []byte, expected, contentDigest string) error {
+	if contentDigest != "" && contentDigest != expected {
+		return fmt.Errorf("Docker-Content-Digest mismatch: expected %q but registry returned %q", expected, contentDigest)
+	}
+	if err := verifyDigest(data, expected); err != nil {
+		return fmt.Errorf("manifest digest mismatch: %w", err)
 	}
 	return nil
 }

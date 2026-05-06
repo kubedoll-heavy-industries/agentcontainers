@@ -17,8 +17,22 @@ import (
 
 // policyDigestOf returns the sha256:<hex> digest of a policy JSON string.
 func policyDigestOf(s string) string {
-	h := sha256.Sum256([]byte(s))
+	return digestOf([]byte(s))
+}
+
+func digestOf(data []byte) string {
+	h := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+func manifestBytes(t *testing.T, manifest ociManifest) []byte {
+	t.Helper()
+
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	return data
 }
 
 func TestFetchPolicy_Success(t *testing.T) {
@@ -331,7 +345,6 @@ func TestFetchPolicy_DigestMismatch(t *testing.T) {
 func TestFetchPolicyBundle_TagRefSuccess(t *testing.T) {
 	bundleJSON := `{"version":1,"policies":[{"name":"default"}]}`
 	bundleDigest := policyDigestOf(bundleJSON)
-	manifestDigest := "sha256:" + strings.Repeat("1", 64)
 
 	manifest := ociManifest{
 		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
@@ -343,6 +356,8 @@ func TestFetchPolicyBundle_TagRefSuccess(t *testing.T) {
 			},
 		},
 	}
+	manifestJSON := manifestBytes(t, manifest)
+	manifestDigest := digestOf(manifestJSON)
 
 	var fetchedByDigest bool
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -353,7 +368,8 @@ func TestFetchPolicyBundle_TagRefSuccess(t *testing.T) {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest):
 			fetchedByDigest = true
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			_ = json.NewEncoder(w).Encode(manifest)
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = w.Write(manifestJSON)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/"+bundleDigest):
 			_, _ = w.Write([]byte(bundleJSON))
 		default:
@@ -380,10 +396,114 @@ func TestFetchPolicyBundle_TagRefSuccess(t *testing.T) {
 	}
 }
 
+func TestFetchPolicyBundle_DigestPinnedRefWrongManifestBodyFails(t *testing.T) {
+	bundleJSON := `{"version":1,"policies":[{"name":"pinned"}]}`
+	bundleDigest := policyDigestOf(bundleJSON)
+	goodManifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{
+				MediaType: PolicyBundleArtifactMediaType,
+				Digest:    bundleDigest,
+				Size:      int64(len(bundleJSON)),
+			},
+		},
+	}
+	goodManifestJSON := manifestBytes(t, goodManifest)
+	manifestDigest := digestOf(goodManifestJSON)
+
+	wrongManifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{
+				MediaType: PolicyBundleArtifactMediaType,
+				Digest:    "sha256:" + strings.Repeat("b", 64),
+				Size:      int64(len(bundleJSON)),
+			},
+		},
+	}
+	wrongManifestJSON := manifestBytes(t, wrongManifest)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest) {
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = w.Write(wrongManifestJSON)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	resolver := NewResolver(WithHTTPClient(srv.Client()))
+	ref := srv.Listener.Addr().String() + "/myorg/policy-bundle@" + manifestDigest
+
+	_, _, err := resolver.FetchPolicyBundle(context.Background(), ref)
+	if err == nil {
+		t.Fatal("FetchPolicyBundle() error = nil, want manifest digest mismatch")
+	}
+	if !strings.Contains(err.Error(), "manifest digest mismatch") {
+		t.Errorf("error = %q, want it to contain 'manifest digest mismatch'", err.Error())
+	}
+}
+
+func TestFetchPolicyBundle_TagResolvedWrongManifestBodyFails(t *testing.T) {
+	bundleJSON := `{"version":1,"policies":[{"name":"resolved"}]}`
+	bundleDigest := policyDigestOf(bundleJSON)
+	goodManifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{
+				MediaType: PolicyBundleArtifactMediaType,
+				Digest:    bundleDigest,
+				Size:      int64(len(bundleJSON)),
+			},
+		},
+	}
+	goodManifestJSON := manifestBytes(t, goodManifest)
+	manifestDigest := digestOf(goodManifestJSON)
+
+	wrongManifest := ociManifest{
+		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{
+				MediaType: PolicyBundleArtifactMediaType,
+				Digest:    "sha256:" + strings.Repeat("c", 64),
+				Size:      int64(len(bundleJSON)),
+			},
+		},
+	}
+	wrongManifestJSON := manifestBytes(t, wrongManifest)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/manifests/latest"):
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest):
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = w.Write(wrongManifestJSON)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	resolver := NewResolver(WithHTTPClient(srv.Client()))
+	ref := srv.Listener.Addr().String() + "/myorg/policy-bundle:latest"
+
+	_, _, err := resolver.FetchPolicyBundle(context.Background(), ref)
+	if err == nil {
+		t.Fatal("FetchPolicyBundle() error = nil, want resolved manifest digest mismatch")
+	}
+	if !strings.Contains(err.Error(), "manifest digest mismatch") {
+		t.Errorf("error = %q, want it to contain 'manifest digest mismatch'", err.Error())
+	}
+}
+
 func TestFetchPolicyBundle_DigestPinnedRefSuccess(t *testing.T) {
 	bundleJSON := `{"version":1,"policies":[{"name":"pinned"}]}`
 	bundleDigest := policyDigestOf(bundleJSON)
-	manifestDigest := "sha256:" + strings.Repeat("2", 64)
 
 	manifest := ociManifest{
 		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
@@ -395,6 +515,8 @@ func TestFetchPolicyBundle_DigestPinnedRefSuccess(t *testing.T) {
 			},
 		},
 	}
+	manifestJSON := manifestBytes(t, manifest)
+	manifestDigest := digestOf(manifestJSON)
 
 	var sawHead bool
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -404,7 +526,8 @@ func TestFetchPolicyBundle_DigestPinnedRefSuccess(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest):
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			_ = json.NewEncoder(w).Encode(manifest)
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = w.Write(manifestJSON)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/"+bundleDigest):
 			_, _ = w.Write([]byte(bundleJSON))
 		default:
@@ -434,7 +557,6 @@ func TestFetchPolicyBundle_DigestPinnedRefSuccess(t *testing.T) {
 func TestFetchPolicyBundle_EmbeddedOrgPolicyLayerDoesNotMatch(t *testing.T) {
 	policyJSON := `{"requireSignatures":true}`
 	policyDigest := policyDigestOf(policyJSON)
-	manifestDigest := "sha256:" + strings.Repeat("3", 64)
 
 	manifest := ociManifest{
 		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
@@ -446,11 +568,13 @@ func TestFetchPolicyBundle_EmbeddedOrgPolicyLayerDoesNotMatch(t *testing.T) {
 			},
 		},
 	}
+	manifestJSON := manifestBytes(t, manifest)
+	manifestDigest := digestOf(manifestJSON)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest) {
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			_ = json.NewEncoder(w).Encode(manifest)
+			_, _ = w.Write(manifestJSON)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -470,18 +594,19 @@ func TestFetchPolicyBundle_EmbeddedOrgPolicyLayerDoesNotMatch(t *testing.T) {
 }
 
 func TestFetchPolicyBundle_MissingBundleLayer(t *testing.T) {
-	manifestDigest := "sha256:" + strings.Repeat("4", 64)
 	manifest := ociManifest{
 		Config: ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
 		Layers: []ociDescriptor{
 			{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Digest: "sha256:" + strings.Repeat("a", 64), Size: 10},
 		},
 	}
+	manifestJSON := manifestBytes(t, manifest)
+	manifestDigest := digestOf(manifestJSON)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest) {
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			_ = json.NewEncoder(w).Encode(manifest)
+			_, _ = w.Write(manifestJSON)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
