@@ -25,13 +25,19 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oci"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/orgpolicy"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/sidecar"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/signing"
 )
+
+func init() {
+	policySignatureVerifierFactory = func() signing.Verifier {
+		return signing.NewMockVerifier()
+	}
+}
 
 func TestLockPinsConfiguredPolicyChannel(t *testing.T) {
 	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	policyJSON := policyBundleJSON(t, 3, expiresAt, nil)
-	manifestDigest := "sha256:" + strings.Repeat("1", 64)
-	policyRef, cleanup := setupPolicyBundleRegistry(t, "prod", manifestDigest, policyJSON)
+	policyRef, manifestDigest, cleanup := setupPolicyBundleRegistry(t, "prod", policyJSON)
 	defer cleanup()
 
 	dir := t.TempDir()
@@ -81,6 +87,12 @@ func TestLockPinsConfiguredPolicyChannel(t *testing.T) {
 	if !lf.Resolved.Policy.ExpiresAt.Equal(expiresAt) {
 		t.Errorf("Policy.ExpiresAt = %s, want %s", lf.Resolved.Policy.ExpiresAt, expiresAt)
 	}
+	if lf.Resolved.Policy.Signature == nil {
+		t.Fatal("Policy.Signature is nil, want policy channel signature pin")
+	}
+	if lf.Resolved.Policy.Signature.KeylessRef != digestPinnedRef(policyRef, manifestDigest) {
+		t.Errorf("Policy.Signature.KeylessRef = %q, want digest-pinned policy ref", lf.Resolved.Policy.Signature.KeylessRef)
+	}
 }
 
 func TestVerifyConfiguredPolicyMissingPinStrictFails(t *testing.T) {
@@ -117,8 +129,7 @@ func TestVerifyPolicyChannelRevokedImageStrictFails(t *testing.T) {
 	imageDigest := "sha256:" + strings.Repeat("b", 64)
 	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	policyJSON := policyBundleJSON(t, 4, expiresAt, []string{imageDigest})
-	manifestDigest := "sha256:" + strings.Repeat("2", 64)
-	policyRef, cleanup := setupPolicyBundleRegistry(t, "prod", manifestDigest, policyJSON)
+	policyRef, manifestDigest, cleanup := setupPolicyBundleRegistry(t, "prod", policyJSON)
 	defer cleanup()
 
 	dir := t.TempDir()
@@ -146,8 +157,7 @@ func TestRunPolicyChannelRevokedImageFailsBeforeStartup(t *testing.T) {
 	imageDigest := "sha256:" + strings.Repeat("c", 64)
 	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	policyJSON := policyBundleJSON(t, 5, expiresAt, []string{imageDigest})
-	manifestDigest := "sha256:" + strings.Repeat("3", 64)
-	policyRef, cleanup := setupPolicyBundleRegistry(t, "prod", manifestDigest, policyJSON)
+	policyRef, manifestDigest, cleanup := setupPolicyBundleRegistry(t, "prod", policyJSON)
 	defer cleanup()
 
 	dir := t.TempDir()
@@ -194,7 +204,220 @@ func TestRunPolicyChannelRevokedImageFailsBeforeStartup(t *testing.T) {
 	}
 }
 
-func setupPolicyBundleRegistry(t *testing.T, tag, manifestDigest, policyJSON string) (string, func()) {
+func TestRunPolicyChannelUnsignedPolicyFailsBeforeStartup(t *testing.T) {
+	imageDigest := "sha256:" + strings.Repeat("4", 64)
+	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	policyJSON := policyBundleJSON(t, 5, expiresAt, nil)
+	policyRef, manifestDigest, cleanup := setupPolicyBundleRegistry(t, "prod", policyJSON)
+	defer cleanup()
+
+	dir := t.TempDir()
+	configPath := writePolicyChannelConfig(t, dir, policyRef, imageDigest)
+	writePolicyChannelLockfile(t, dir, imageDigest, policyRef, manifestDigest, 5, expiresAt)
+
+	previousVerifier := policySignatureVerifierFactory
+	policySignatureVerifierFactory = func() signing.Verifier {
+		return signing.NewMockVerifierFailing()
+	}
+	t.Cleanup(func() {
+		policySignatureVerifierFactory = previousVerifier
+	})
+
+	var sidecarCalls int
+	var runtimeFactoryCalls int
+	var extractPolicyCalls int
+
+	restoreRunHooks(t)
+	runResolveSidecar = func(*cobra.Command, *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
+		sidecarCalls++
+		return nil, "", nil
+	}
+	runRuntimeFactory = func(string, *zap.Logger, enforcement.Level) (container.Runtime, error) {
+		runtimeFactoryCalls++
+		return &recordingRuntime{}, nil
+	}
+	runExtractPolicy = func(context.Context, string, ...oci.ResolverOption) (*orgpolicy.OrgPolicy, error) {
+		extractPolicyCalls++
+		return orgpolicy.DefaultPolicy(), nil
+	}
+	runMergePolicy = func(*orgpolicy.OrgPolicy, *config.AgentContainer) error { return nil }
+	runVerifyImageSignature = func(*cobra.Command, *config.AgentContainer, string) error { return nil }
+	runNewDockerClient = func() (client.APIClient, error) { return nil, nil }
+
+	cmd := newRunCmd()
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	err := runRun(cmd, false, time.Minute, configPath, "docker", true, false)
+	if err == nil {
+		t.Fatal("expected run error for unsigned policy bundle")
+	}
+	if !strings.Contains(err.Error(), "signature verification failed") {
+		t.Fatalf("run error = %v, want policy signature verification failure", err)
+	}
+	if sidecarCalls != 0 || runtimeFactoryCalls != 0 || extractPolicyCalls != 0 {
+		t.Fatalf("policy signature failure should happen before startup: sidecar=%d runtimeFactory=%d extractPolicy=%d",
+			sidecarCalls, runtimeFactoryCalls, extractPolicyCalls)
+	}
+}
+
+func TestRunPolicyChannelStaleDigestFailsBeforeStartup(t *testing.T) {
+	imageDigest := "sha256:" + strings.Repeat("d", 64)
+	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	policyJSON := policyBundleJSON(t, 6, expiresAt, nil)
+	lockedDigest := "sha256:" + strings.Repeat("5", 64)
+	policyRef, currentDigest, cleanup := setupPolicyBundleRegistry(t, "prod", policyJSON)
+	defer cleanup()
+	if lockedDigest == currentDigest {
+		t.Fatal("test setup needs distinct locked and current policy digests")
+	}
+
+	dir := t.TempDir()
+	configPath := writePolicyChannelConfig(t, dir, policyRef, imageDigest)
+	writePolicyChannelLockfile(t, dir, imageDigest, policyRef, lockedDigest, 5, expiresAt)
+
+	var sidecarCalls int
+	var runtimeFactoryCalls int
+	var extractPolicyCalls int
+
+	restoreRunHooks(t)
+	runResolveSidecar = func(*cobra.Command, *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
+		sidecarCalls++
+		return nil, "", nil
+	}
+	runRuntimeFactory = func(string, *zap.Logger, enforcement.Level) (container.Runtime, error) {
+		runtimeFactoryCalls++
+		return &recordingRuntime{}, nil
+	}
+	runExtractPolicy = func(context.Context, string, ...oci.ResolverOption) (*orgpolicy.OrgPolicy, error) {
+		extractPolicyCalls++
+		return orgpolicy.DefaultPolicy(), nil
+	}
+	runMergePolicy = func(*orgpolicy.OrgPolicy, *config.AgentContainer) error { return nil }
+	runVerifyImageSignature = func(*cobra.Command, *config.AgentContainer, string) error { return nil }
+	runNewDockerClient = func() (client.APIClient, error) { return nil, nil }
+
+	cmd := newRunCmd()
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	err := runRun(cmd, false, time.Minute, configPath, "docker", true, false)
+	if err == nil {
+		t.Fatal("expected run error for stale policy digest")
+	}
+	if !strings.Contains(err.Error(), "policy "+policyRef+" digest changed") {
+		t.Fatalf("run error = %v, want stale policy digest", err)
+	}
+	if sidecarCalls != 0 || runtimeFactoryCalls != 0 || extractPolicyCalls != 0 {
+		t.Fatalf("policy digest mismatch should happen before startup: sidecar=%d runtimeFactory=%d extractPolicy=%d",
+			sidecarCalls, runtimeFactoryCalls, extractPolicyCalls)
+	}
+}
+
+func TestPolicyChannelSameEpochDifferentDigestRejected(t *testing.T) {
+	locked := &config.ResolvedPolicy{
+		Ref:    "ghcr.io/acme/policy:prod",
+		Digest: "sha256:" + strings.Repeat("6", 64),
+		Epoch:  7,
+	}
+	current := &config.ResolvedPolicy{
+		Ref:    locked.Ref,
+		Digest: "sha256:" + strings.Repeat("7", 64),
+		Epoch:  locked.Epoch,
+	}
+
+	err := checkPolicyReplacement(locked, current)
+	if err == nil {
+		t.Fatal("expected same-epoch replacement error")
+	}
+	if !strings.Contains(err.Error(), "same-epoch policy replacement detected") {
+		t.Fatalf("error = %v, want same-epoch replacement diagnostic", err)
+	}
+}
+
+func TestRunPolicyChannelUnpinnedMCPAndSkillFailBeforeFetch(t *testing.T) {
+	dir := t.TempDir()
+	imageDigest := "sha256:" + strings.Repeat("e", 64)
+	policyRef := "ghcr.io/acme/agentcontainers-policy:prod"
+	configPath := filepath.Join(dir, "agentcontainer.json")
+	configContent := fmt.Sprintf(`{
+  "name": "policy-channel-tools",
+  "image": "registry.example/app:1@%s",
+  "agent": {
+    "tools": {
+      "mcp": {
+        "github": {"image": "ghcr.io/acme/github-mcp:1"}
+      },
+      "skills": {
+        "review": {"artifact": "ghcr.io/acme/skills/review:1"}
+      }
+    },
+    "provenance": {
+      "policy": {"ref": %q}
+    }
+  }
+}`, imageDigest, policyRef)
+	if err := os.WriteFile(configPath, []byte(configContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writePolicyChannelLockfile(t, dir, imageDigest, policyRef, "sha256:"+strings.Repeat("8", 64), 8, time.Now().UTC().Add(time.Hour))
+
+	cfg, err := config.ParseFile(configPath)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+
+	err = verifyRunPolicyChannel(context.Background(), cfg, configPath, forbiddenPolicyBundleFetcher{t: t})
+	if err == nil {
+		t.Fatal("expected run policy channel coverage error")
+	}
+	if !strings.Contains(err.Error(), "mcp github is not pinned in lockfile") {
+		t.Fatalf("error = %v, want missing mcp lock entry", err)
+	}
+	if !strings.Contains(err.Error(), "skill review is not pinned in lockfile") {
+		t.Fatalf("error = %v, want missing skill lock entry", err)
+	}
+}
+
+func TestVerifyStrictOfflineExpiredLockedPolicyFailsWithoutRegistryFetch(t *testing.T) {
+	dir := t.TempDir()
+	imageDigest := "sha256:" + strings.Repeat("f", 64)
+	policyRef := "ghcr.io/acme/agentcontainers-policy:prod"
+	configPath := writePolicyChannelConfig(t, dir, policyRef, imageDigest)
+	writePolicyChannelLockfile(t, dir, imageDigest, policyRef, "sha256:"+strings.Repeat("9", 64), 9, time.Now().UTC().Add(-time.Hour))
+
+	var out bytes.Buffer
+	cmd := newRootCmd("test", "abc", "now")
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"verify", "--config", configPath, "--registry=false", "--strict"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected strict offline verify error for expired locked policy")
+	}
+	if !strings.Contains(err.Error(), "policy-fail") {
+		t.Fatalf("strict error = %v, want policy-fail", err)
+	}
+	if !strings.Contains(out.String(), "POLICY FAIL: policy "+policyRef+": locked policy is expired") {
+		t.Fatalf("verify output missing expired locked policy diagnostic:\n%s", out.String())
+	}
+}
+
+type forbiddenPolicyBundleFetcher struct {
+	t *testing.T
+}
+
+func (f forbiddenPolicyBundleFetcher) FetchPolicyBundle(context.Context, string) ([]byte, string, error) {
+	f.t.Helper()
+	f.t.Fatal("policy bundle fetch should not be called when lockfile coverage is missing")
+	return nil, "", fmt.Errorf("unexpected policy bundle fetch")
+}
+
+func setupPolicyBundleRegistry(t *testing.T, tag, policyJSON string) (string, string, func()) {
 	t.Helper()
 
 	policyDigest := digestOf(policyJSON)
@@ -214,6 +437,11 @@ func setupPolicyBundleRegistry(t *testing.T, tag, manifestDigest, policyJSON str
 			},
 		},
 	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest := digestOf(string(manifestBytes))
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -222,7 +450,7 @@ func setupPolicyBundleRegistry(t *testing.T, tag, manifestDigest, policyJSON str
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+manifestDigest):
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			_ = json.NewEncoder(w).Encode(manifest)
+			_, _ = w.Write(manifestBytes)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/"+policyDigest):
 			_, _ = w.Write([]byte(policyJSON))
 		default:
@@ -237,7 +465,7 @@ func setupPolicyBundleRegistry(t *testing.T, tag, manifestDigest, policyJSON str
 	}
 
 	addr := strings.TrimPrefix(srv.URL, "https://")
-	return addr + "/acme/policy:" + tag, func() {
+	return addr + "/acme/policy:" + tag, manifestDigest, func() {
 		resolverFactory = oldFactory
 		srv.Close()
 	}
@@ -279,6 +507,11 @@ func writePolicyChannelLockfile(t *testing.T, dir, imageDigest, policyRef, polic
 				Epoch:      epoch,
 				ExpiresAt:  expiresAt,
 				ResolvedAt: now,
+				Signature: &config.SignatureRef{
+					KeylessRef: digestPinnedRef(policyRef, policyDigest),
+					Subject:    "test@example.com",
+					Issuer:     "https://issuer.example.com",
+				},
 			},
 		},
 	})

@@ -243,6 +243,7 @@ func runVerifyFull(cmd *cobra.Command, configPath, lockfilePath string, strict, 
 	if policyRef != "" && lf.Resolved.Policy == nil {
 		result.missing = append(result.missing, fmt.Sprintf("policy %s: not pinned in lockfile", policyRef))
 	}
+	verifyLockedPolicyChannel(policyRef, lf, time.Now().UTC(), &result)
 
 	// 5. Registry freshness check: compare lockfile digests against live registry.
 	if registry {
@@ -347,12 +348,33 @@ func verifyPolicyChannel(ctx context.Context, cfg *config.AgentContainer, lf *co
 			fmt.Sprintf("policy %s: lockfile has %s, registry has %s",
 				policyRef, lf.Resolved.Policy.Digest, currentPolicy.Digest))
 	}
-	if err := checkPolicyRollback(lf.Resolved.Policy, bundle); err != nil {
+	if err := checkPolicyReplacement(lf.Resolved.Policy, currentPolicy); err != nil {
 		result.errors = append(result.errors, fmt.Sprintf("policy %s: %v", policyRef, err))
 		return
 	}
+	if _, err := verifyPolicyChannelSignature(ctx, policyRef, currentPolicy.Digest, signing.VerifyOptions{}); err != nil {
+		result.sigInvalid = append(result.sigInvalid, fmt.Sprintf("policy %s: %v", policyRef, err))
+	}
 	for _, issue := range evaluatePolicyChannelArtifacts(cfg, lf, bundle, now) {
 		result.policyFail = append(result.policyFail, fmt.Sprintf("%s: %v", issue.label, issue.err))
+	}
+}
+
+func verifyLockedPolicyChannel(policyRef string, lf *config.Lockfile, now time.Time, result *verifyResult) {
+	if policyRef == "" || lf == nil || lf.Resolved.Policy == nil {
+		return
+	}
+	if lf.Resolved.Policy.ExpiresAt.IsZero() {
+		result.policyFail = append(result.policyFail, fmt.Sprintf("policy %s: locked policy expiresAt is missing", policyRef))
+		return
+	}
+	if !lf.Resolved.Policy.ExpiresAt.After(now) {
+		result.policyFail = append(result.policyFail,
+			fmt.Sprintf("policy %s: locked policy is expired: expiresAt %s is not after %s",
+				policyRef, lf.Resolved.Policy.ExpiresAt.Format(time.RFC3339), now.Format(time.RFC3339)))
+	}
+	if lf.Resolved.Policy.Signature == nil {
+		result.sigInvalid = append(result.sigInvalid, fmt.Sprintf("policy %s: locked policy signature is missing", policyRef))
 	}
 }
 

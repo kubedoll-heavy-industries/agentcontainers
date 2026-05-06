@@ -504,17 +504,28 @@ func verifyRunPolicyChannel(ctx context.Context, cfg *config.AgentContainer, cfg
 	if lf.Resolved.Policy == nil {
 		return fmt.Errorf("run: mutable policy channel: policy %s is not pinned in lockfile", policyRef)
 	}
-	if cfg.Image != "" && lf.Resolved.Image == nil {
-		return fmt.Errorf("run: mutable policy channel: image %s is not pinned in lockfile", cfg.Image)
+	if coverageIssues := requirePolicyChannelLockCoverage(cfg, lf); len(coverageIssues) > 0 {
+		var msgs []string
+		for _, issue := range coverageIssues {
+			msgs = append(msgs, issue.label+" is not pinned in lockfile")
+		}
+		return fmt.Errorf("run: mutable policy channel requires lockfile coverage: %s", strings.Join(msgs, "; "))
 	}
 
 	now := time.Now().UTC()
-	_, bundle, err := resolvePolicyChannel(ctx, fetcher, policyRef, now)
+	currentPolicy, bundle, err := resolvePolicyChannel(ctx, fetcher, policyRef, now)
 	if err != nil {
 		return fmt.Errorf("run: mutable policy channel: fetching policy %s: %w", policyRef, err)
 	}
-	if err := checkPolicyRollback(lf.Resolved.Policy, bundle); err != nil {
+	if err := checkPolicyReplacement(lf.Resolved.Policy, currentPolicy); err != nil {
 		return fmt.Errorf("run: mutable policy channel: policy %s: %w", policyRef, err)
+	}
+	if currentPolicy.Digest != lf.Resolved.Policy.Digest {
+		return fmt.Errorf("run: mutable policy channel: policy %s digest changed: lockfile has %s, registry has %s",
+			policyRef, lf.Resolved.Policy.Digest, currentPolicy.Digest)
+	}
+	if _, err := verifyPolicyChannelSignature(ctx, policyRef, currentPolicy.Digest, signing.VerifyOptions{}); err != nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s signature verification failed: %w", policyRef, err)
 	}
 	if issues := evaluatePolicyChannelArtifacts(cfg, lf, bundle, now); len(issues) > 0 {
 		var msgs []string

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oci"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/signing"
 )
 
 func newLockCmd() *cobra.Command {
@@ -165,6 +166,11 @@ func runLock(cmd *cobra.Command, configPath, outputPath string) error {
 		if err != nil {
 			return fmt.Errorf("lock: resolving policy %s: %w", policyRef, err)
 		}
+		signature, err := verifyPolicyChannelSignature(ctx, policyRef, resolvedPolicy.Digest, signing.VerifyOptions{})
+		if err != nil {
+			return fmt.Errorf("lock: verifying policy %s signature: %w", policyRef, err)
+		}
+		resolvedPolicy.Signature = signature
 		lf.Resolved.Policy = resolvedPolicy
 		_, _ = fmt.Fprintf(out, "  policy: %s -> %s (epoch %d)\n", policyRef, resolvedPolicy.Digest, resolvedPolicy.Epoch)
 	}
