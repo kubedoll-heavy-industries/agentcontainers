@@ -265,7 +265,7 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	}
 	logger.Info("enforcement level resolved", zap.String("level", enfLevel.String()), zap.String("source", enfSource))
 
-	rt, err := runRuntimeFactory(runtimeFlag, logger, enfLevel)
+	rt, err := runRuntimeFactory(string(resolvedRuntime), logger, enfLevel)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
@@ -519,10 +519,6 @@ func verifyRunPolicyChannel(ctx context.Context, cfg *config.AgentContainer, cfg
 	}
 	if err := checkPolicyReplacement(lf.Resolved.Policy, currentPolicy); err != nil {
 		return fmt.Errorf("run: mutable policy channel: policy %s: %w", policyRef, err)
-	}
-	if currentPolicy.Digest != lf.Resolved.Policy.Digest {
-		return fmt.Errorf("run: mutable policy channel: policy %s digest changed: lockfile has %s, registry has %s",
-			policyRef, lf.Resolved.Policy.Digest, currentPolicy.Digest)
 	}
 	if _, err := verifyPolicyChannelSignature(ctx, policyRef, currentPolicy.Digest, signing.VerifyOptions{}); err != nil {
 		return fmt.Errorf("run: mutable policy channel: policy %s signature verification failed: %w", policyRef, err)

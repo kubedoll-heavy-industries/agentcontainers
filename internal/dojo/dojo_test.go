@@ -29,6 +29,15 @@ func (f *fakeRunner) RunInteractive(_ context.Context, _ string, _ io.Reader, _ 
 	return nil
 }
 
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRunNoStartPreparesCodexRedteamConfig(t *testing.T) {
 	dir := t.TempDir()
 	var out bytes.Buffer
@@ -54,6 +63,9 @@ func TestRunNoStartPreparesCodexRedteamConfig(t *testing.T) {
 	}
 	if len(runner.captured) != 0 {
 		t.Fatalf("captured commands = %#v, want none for --no-start", runner.captured)
+	}
+	if containsArg(result.StartCommand, "--insecure-skip-org-policy") {
+		t.Fatalf("StartCommand = %#v, must not skip org policy by default", result.StartCommand)
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "workspace", "agentcontainer.json"))
@@ -85,6 +97,27 @@ func TestRunNoStartPreparesCodexRedteamConfig(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "/proc/1/root"+result.HostCanaryPath) {
 		t.Fatalf("output missing proc-root host canary probe:\n%s", out.String())
+	}
+}
+
+func TestRunNoStartCanOptIntoSkippingOrgPolicy(t *testing.T) {
+	dir := t.TempDir()
+	var out bytes.Buffer
+
+	result, err := Run(context.Background(), Options{
+		BaseDir:               dir,
+		AgentcontainerPath:    "/agentcontainer",
+		InsecureSkipOrgPolicy: true,
+		NoStart:               true,
+		Stdout:                &out,
+		Stderr:                io.Discard,
+		Runner:                &fakeRunner{},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsArg(result.StartCommand, "--insecure-skip-org-policy") {
+		t.Fatalf("StartCommand = %#v, want explicit org-policy skip flag", result.StartCommand)
 	}
 }
 

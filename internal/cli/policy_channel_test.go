@@ -263,7 +263,7 @@ func TestRunPolicyChannelUnsignedPolicyFailsBeforeStartup(t *testing.T) {
 	}
 }
 
-func TestRunPolicyChannelStaleDigestFailsBeforeStartup(t *testing.T) {
+func TestRunPolicyChannelSameEpochDigestChangeFailsBeforeStartup(t *testing.T) {
 	imageDigest := "sha256:" + strings.Repeat("d", 64)
 	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	policyJSON := policyBundleJSON(t, 6, expiresAt, nil)
@@ -276,7 +276,7 @@ func TestRunPolicyChannelStaleDigestFailsBeforeStartup(t *testing.T) {
 
 	dir := t.TempDir()
 	configPath := writePolicyChannelConfig(t, dir, policyRef, imageDigest)
-	writePolicyChannelLockfile(t, dir, imageDigest, policyRef, lockedDigest, 5, expiresAt)
+	writePolicyChannelLockfile(t, dir, imageDigest, policyRef, lockedDigest, 6, expiresAt)
 
 	var sidecarCalls int
 	var runtimeFactoryCalls int
@@ -307,14 +307,63 @@ func TestRunPolicyChannelStaleDigestFailsBeforeStartup(t *testing.T) {
 
 	err := runRun(cmd, false, time.Minute, configPath, "docker", true, false)
 	if err == nil {
-		t.Fatal("expected run error for stale policy digest")
+		t.Fatal("expected run error for same-epoch policy replacement")
 	}
-	if !strings.Contains(err.Error(), "policy "+policyRef+" digest changed") {
-		t.Fatalf("run error = %v, want stale policy digest", err)
+	if !strings.Contains(err.Error(), "same-epoch policy replacement detected") {
+		t.Fatalf("run error = %v, want same-epoch replacement diagnostic", err)
 	}
 	if sidecarCalls != 0 || runtimeFactoryCalls != 0 || extractPolicyCalls != 0 {
-		t.Fatalf("policy digest mismatch should happen before startup: sidecar=%d runtimeFactory=%d extractPolicy=%d",
+		t.Fatalf("policy replacement should be rejected before startup: sidecar=%d runtimeFactory=%d extractPolicy=%d",
 			sidecarCalls, runtimeFactoryCalls, extractPolicyCalls)
+	}
+}
+
+func TestRunPolicyChannelEpochAdvanceCanReachStartup(t *testing.T) {
+	imageDigest := "sha256:" + strings.Repeat("a", 64)
+	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	policyJSON := policyBundleJSON(t, 7, expiresAt, nil)
+	lockedDigest := "sha256:" + strings.Repeat("5", 64)
+	policyRef, currentDigest, cleanup := setupPolicyBundleRegistry(t, "prod", policyJSON)
+	defer cleanup()
+	if lockedDigest == currentDigest {
+		t.Fatal("test setup needs distinct locked and current policy digests")
+	}
+
+	dir := t.TempDir()
+	configPath := writePolicyChannelConfig(t, dir, policyRef, imageDigest)
+	writePolicyChannelLockfile(t, dir, imageDigest, policyRef, lockedDigest, 6, expiresAt)
+
+	var runtimeFactoryCalls int
+	var extractPolicyCalls int
+
+	restoreRunHooks(t)
+	runResolveSidecar = func(*cobra.Command, *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
+		return nil, "", nil
+	}
+	runRuntimeFactory = func(string, *zap.Logger, enforcement.Level) (container.Runtime, error) {
+		runtimeFactoryCalls++
+		return &recordingRuntime{}, nil
+	}
+	runExtractPolicy = func(context.Context, string, ...oci.ResolverOption) (*orgpolicy.OrgPolicy, error) {
+		extractPolicyCalls++
+		return orgpolicy.DefaultPolicy(), nil
+	}
+	runMergePolicy = func(*orgpolicy.OrgPolicy, *config.AgentContainer) error { return nil }
+	runVerifyImageSignature = func(*cobra.Command, *config.AgentContainer, string) error { return nil }
+	runNewDockerClient = func() (client.APIClient, error) { return nil, nil }
+
+	cmd := newRunCmd()
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	err := runRun(cmd, true, time.Minute, configPath, "docker", true, false)
+	if err != nil {
+		t.Fatalf("runRun() error = %v, want epoch advance to reach startup", err)
+	}
+	if runtimeFactoryCalls != 1 || extractPolicyCalls != 1 {
+		t.Fatalf("run did not reach startup path: runtimeFactory=%d extractPolicy=%d", runtimeFactoryCalls, extractPolicyCalls)
 	}
 }
 

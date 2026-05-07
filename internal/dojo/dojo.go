@@ -31,21 +31,22 @@ const (
 
 // Options controls a dojo run.
 type Options struct {
-	Profile            string
-	BaseDir            string
-	AgentcontainerPath string
-	Image              string
-	EnforcerImage      string
-	Runtime            string
-	Model              string
-	BuildImage         bool
-	NoStart            bool
-	NoChat             bool
-	Shell              bool
-	Stdin              io.Reader
-	Stdout             io.Writer
-	Stderr             io.Writer
-	Runner             CommandRunner
+	Profile               string
+	BaseDir               string
+	AgentcontainerPath    string
+	Image                 string
+	EnforcerImage         string
+	Runtime               string
+	Model                 string
+	BuildImage            bool
+	NoStart               bool
+	NoChat                bool
+	Shell                 bool
+	InsecureSkipOrgPolicy bool
+	Stdin                 io.Reader
+	Stdout                io.Writer
+	Stderr                io.Writer
+	Runner                CommandRunner
 }
 
 // Result describes the prepared harness.
@@ -193,7 +194,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		}
 	}
 
-	startCmd := []string{opts.AgentcontainerPath, "run", "--detach", "--config", cfgPath, "--runtime", opts.Runtime, "--insecure-skip-org-policy"}
+	startCmd := []string{opts.AgentcontainerPath, "run", "--detach", "--config", cfgPath, "--runtime", opts.Runtime}
+	if opts.InsecureSkipOrgPolicy {
+		startCmd = append(startCmd, "--insecure-skip-org-policy")
+	}
 	result.StartCommand = startCmd
 
 	var output string

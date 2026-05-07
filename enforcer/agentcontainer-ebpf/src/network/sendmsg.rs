@@ -155,7 +155,7 @@ fn emit_block_event_v6(dst_ip6: &[u32; 4], dst_port: u16, proto: u8) {
 pub fn ac_sendmsg4(ctx: SockAddrContext) -> i32 {
     match try_sendmsg4(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // fail-open on BPF errors
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 
@@ -224,7 +224,7 @@ fn try_sendmsg4(ctx: &SockAddrContext) -> Result<i32, i64> {
 pub fn ac_sendmsg6(ctx: SockAddrContext) -> i32 {
     match try_sendmsg6(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // fail-open on BPF errors
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 

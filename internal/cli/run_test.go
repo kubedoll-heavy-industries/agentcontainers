@@ -241,6 +241,44 @@ func TestRuntimeAutoFlag(t *testing.T) {
 	}
 }
 
+func TestRunRuntimeAutoUsesResolvedRuntime(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "agentcontainer.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"name":"test","image":"alpine:3.19","agent":{"enforcer":{"required":false}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotRuntime string
+	restoreRunHooks(t)
+	runResolveSidecar = func(*cobra.Command, *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
+		return nil, "", nil
+	}
+	runRuntimeFactory = func(runtimeName string, _ *zap.Logger, _ enforcement.Level) (container.Runtime, error) {
+		gotRuntime = runtimeName
+		return &recordingRuntime{}, nil
+	}
+	runExtractPolicy = func(context.Context, string, ...oci.ResolverOption) (*orgpolicy.OrgPolicy, error) {
+		return orgpolicy.DefaultPolicy(), nil
+	}
+	runMergePolicy = func(*orgpolicy.OrgPolicy, *config.AgentContainer) error { return nil }
+	runVerifyImageSignature = func(*cobra.Command, *config.AgentContainer, string) error { return nil }
+
+	cmd := newRunCmd()
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	if err := runRun(cmd, true, time.Minute, cfgPath, "auto", true, false); err != nil {
+		t.Fatalf("runRun() error = %v", err)
+	}
+	if gotRuntime == "auto" || gotRuntime == "" {
+		t.Fatalf("runRuntimeFactory runtime = %q, want resolved runtime", gotRuntime)
+	}
+	if gotRuntime != string(container.RuntimeDocker) && gotRuntime != string(container.RuntimeSandbox) {
+		t.Fatalf("runRuntimeFactory runtime = %q, want docker or sandbox", gotRuntime)
+	}
+}
+
 func TestNewRuntime_UnknownRuntime(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -998,10 +998,12 @@ impl Enforcer for EnforcerService {
             })?
         };
 
-        // Resolve each DenySetEntry: stat binary via /proc/<init_pid>/root/<path>.
+        // Resolve each DenySetEntry through the same container-root path
+        // validator used by process policy. Do not concatenate untrusted gRPC
+        // paths into /proc/<pid>/root.
         let mut resolved_entries = Vec::with_capacity(req.allowed_entries.len());
         for entry in &req.allowed_entries {
-            let proc_path = format!("/proc/{}/root{}", init_pid, entry.binary_path);
+            let proc_path = resolve_deny_set_binary(init_pid, &entry.binary_path)?;
             let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
             resolved_entries.push(policy::ResolvedDenySetEntry {
                 deny_set_id: entry.deny_set_id,
@@ -1011,10 +1013,11 @@ impl Enforcer for EnforcerService {
             });
         }
 
-        // Resolve each DenySetTransition: stat child binary similarly.
+        // Resolve each DenySetTransition child binary through the validated
+        // container-root resolver.
         let mut resolved_transitions = Vec::with_capacity(req.transitions.len());
         for t in &req.transitions {
-            let proc_path = format!("/proc/{}/root{}", init_pid, t.child_binary_path);
+            let proc_path = resolve_deny_set_binary(init_pid, &t.child_binary_path)?;
             let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
             resolved_transitions.push(policy::ResolvedDenySetTransition {
                 parent_deny_set_id: t.parent_deny_set_id,
@@ -1068,8 +1071,8 @@ impl Enforcer for EnforcerService {
             })?
         };
 
-        // Stat the binary via /proc/<init_pid>/root/<path>.
-        let proc_path = format!("/proc/{}/root{}", init_pid, req.binary_path);
+        // Stat the binary via the validated /proc/<init_pid>/root resolver.
+        let proc_path = resolve_deny_set_binary(init_pid, &req.binary_path)?;
         let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
 
         let entry = policy::ResolvedDenySetEntry {
@@ -1297,9 +1300,23 @@ fn resolve_process_binaries(init_pid: u32, binaries: &[String]) -> Result<Vec<St
     Ok(resolved)
 }
 
+fn resolve_deny_set_binary(init_pid: u32, binary: &str) -> Result<String, Status> {
+    if !binary.starts_with('/') {
+        return Err(Status::invalid_argument(
+            "deny-set binary path must be absolute",
+        ));
+    }
+    resolve_process_binary(init_pid, binary)
+}
+
 fn resolve_process_binary(init_pid: u32, binary: &str) -> Result<String, Status> {
     if binary.trim().is_empty() {
         return Err(Status::invalid_argument("process binary must not be empty"));
+    }
+    if binary.contains("..") {
+        return Err(Status::invalid_argument(
+            "process binary must not contain '..'",
+        ));
     }
 
     let proc_root = format!("/proc/{}/root", init_pid);
@@ -1672,6 +1689,20 @@ mod tests {
         );
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_resolve_deny_set_binary_rejects_relative_path() {
+        let err = resolve_deny_set_binary(12345, "bin/sh").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must be absolute"));
+    }
+
+    #[test]
+    fn test_resolve_deny_set_binary_rejects_path_traversal() {
+        let err = resolve_deny_set_binary(12345, "/../../../etc/shadow").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must not contain '..'"));
     }
 
     #[tokio::test]

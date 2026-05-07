@@ -13,16 +13,17 @@ var runDojo = dojo.Run
 
 func newDojoCmd() *cobra.Command {
 	var (
-		baseDir       string
-		image         string
-		enforcerImage string
-		runtimeFlag   string
-		model         string
-		buildImage    bool
-		noBuild       bool
-		noStart       bool
-		noChat        bool
-		shell         bool
+		baseDir               string
+		image                 string
+		enforcerImage         string
+		runtimeFlag           string
+		model                 string
+		buildImage            bool
+		noBuild               bool
+		noStart               bool
+		noChat                bool
+		shell                 bool
+		insecureSkipOrgPolicy bool
 	)
 
 	cmd := &cobra.Command{
@@ -54,20 +55,21 @@ Codex automatically.`,
 			}
 
 			_, err = runDojo(cmd.Context(), dojo.Options{
-				Profile:            profile,
-				BaseDir:            baseDir,
-				AgentcontainerPath: agentPath,
-				Image:              image,
-				EnforcerImage:      enforcerImage,
-				Runtime:            runtimeFlag,
-				Model:              model,
-				BuildImage:         buildImage,
-				NoStart:            noStart,
-				NoChat:             noChat,
-				Shell:              shell,
-				Stdin:              cmd.InOrStdin(),
-				Stdout:             cmd.OutOrStdout(),
-				Stderr:             cmd.ErrOrStderr(),
+				Profile:               profile,
+				BaseDir:               baseDir,
+				AgentcontainerPath:    agentPath,
+				Image:                 image,
+				EnforcerImage:         enforcerImage,
+				Runtime:               runtimeFlag,
+				Model:                 model,
+				BuildImage:            buildImage,
+				NoStart:               noStart,
+				NoChat:                noChat,
+				Shell:                 shell,
+				InsecureSkipOrgPolicy: insecureSkipOrgPolicy,
+				Stdin:                 cmd.InOrStdin(),
+				Stdout:                cmd.OutOrStdout(),
+				Stderr:                cmd.ErrOrStderr(),
 			})
 			return err
 		},
@@ -83,6 +85,7 @@ Codex automatically.`,
 	cmd.Flags().BoolVar(&noStart, "no-start", false, "Prepare files and print commands without starting the container")
 	cmd.Flags().BoolVar(&noChat, "no-chat", false, "Start the harness but do not enter Codex chat")
 	cmd.Flags().BoolVar(&shell, "shell", false, "Drop into an interactive shell instead of Codex chat")
+	cmd.Flags().BoolVar(&insecureSkipOrgPolicy, "insecure-skip-org-policy", false, "Skip image org-policy extraction for local dojo images (dev only)")
 
 	return cmd
 }

@@ -138,7 +138,7 @@ fn try_bind(ctx: &SockAddrContext) -> Result<i32, i64> {
 pub fn ac_bind4(ctx: SockAddrContext) -> i32 {
     match try_bind(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // fail-open on BPF errors
+        Err(_) => VERDICT_BLOCK, // Block on BPF errors.
     }
 }
 
@@ -150,6 +150,6 @@ pub fn ac_bind4(ctx: SockAddrContext) -> i32 {
 pub fn ac_bind6(ctx: SockAddrContext) -> i32 {
     match try_bind(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // fail-open on BPF errors
+        Err(_) => VERDICT_BLOCK, // Block on BPF errors.
     }
 }

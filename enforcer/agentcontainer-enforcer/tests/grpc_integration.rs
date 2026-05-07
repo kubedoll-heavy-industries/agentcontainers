@@ -142,6 +142,7 @@ async fn test_register_container() {
         .register_container(RegisterContainerRequest {
             container_id: "test-ctr-1".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register_container failed")
@@ -165,6 +166,7 @@ async fn test_register_unregister_roundtrip() {
         .register_container(RegisterContainerRequest {
             container_id: "test-roundtrip".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed")
@@ -199,6 +201,7 @@ async fn test_apply_network_policy() {
         .register_container(RegisterContainerRequest {
             container_id: "test-net".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed");
@@ -235,6 +238,7 @@ async fn test_apply_filesystem_policy() {
         .register_container(RegisterContainerRequest {
             container_id: "test-fs".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed");
@@ -267,6 +271,7 @@ async fn test_apply_process_policy() {
         .register_container(RegisterContainerRequest {
             container_id: "test-proc".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed");
@@ -297,6 +302,7 @@ async fn test_apply_credential_policy() {
         .register_container(RegisterContainerRequest {
             container_id: "test-cred".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed");
@@ -331,6 +337,7 @@ async fn test_get_stats() {
         .register_container(RegisterContainerRequest {
             container_id: "test-stats".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed");
@@ -362,6 +369,7 @@ async fn test_stream_events_connects() {
         .register_container(RegisterContainerRequest {
             container_id: "test-events".into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed");
@@ -429,6 +437,7 @@ async fn test_invalid_cgroup_fails() {
         .register_container(RegisterContainerRequest {
             container_id: "test-bad-cgroup".into(),
             cgroup_path: "/sys/fs/cgroup/this/path/does/not/exist".into(),
+            init_pid: 1,
         })
         .await;
 
@@ -478,6 +487,7 @@ async fn test_full_lifecycle() {
         .register_container(RegisterContainerRequest {
             container_id: container_id.into(),
             cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid: 1,
         })
         .await
         .expect("register failed")

@@ -204,6 +204,11 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 		return nil, fmt.Errorf("docker runtime: inspecting container for init PID: %w", err)
 	}
 	initPID := uint32(inspectResult.Container.State.Pid)
+	if initPID == 0 {
+		_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
+		_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+		return nil, fmt.Errorf("docker runtime: inspecting container for init PID: container has no running init process")
+	}
 
 	// Post-start enforcement: register the container and apply policy via the
 	// enforcer sidecar. Must happen after ContainerStart because the cgroup is

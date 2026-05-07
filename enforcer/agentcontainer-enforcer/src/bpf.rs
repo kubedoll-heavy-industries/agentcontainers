@@ -246,10 +246,18 @@ mod linux {
                 }
             }
 
-            warn!(
-                "ac_file_open LSM enforcement disabled; filesystem policy needs container-root \
-                 path/glob resolution before this hook can be safely fail-closed"
-            );
+            match bpf.program_mut("ac_file_open") {
+                Some(prog) => {
+                    let lsm: &mut Lsm = prog.try_into()?;
+                    lsm.load("file_open", &btf)?;
+                    lsm.attach()
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_file_open: {e}"))?;
+                    info!("attached ac_file_open to LSM file_open");
+                }
+                None => {
+                    return Err(anyhow::anyhow!("BPF program ac_file_open not found in ELF"));
+                }
+            }
 
             // ---------------------------------------------------------------
             // Tracepoints
@@ -303,17 +311,36 @@ mod linux {
             // Cgroup socket address hooks (bind enforcement)
             // ---------------------------------------------------------------
 
+            for program_name in ["ac_connect4", "ac_connect6", "ac_sendmsg4", "ac_sendmsg6"] {
+                match bpf.program_mut(program_name) {
+                    Some(prog) => {
+                        let cg: &mut CgroupSockAddr = prog.try_into()?;
+                        cg.load()?;
+                        cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                            .map_err(|e| anyhow::anyhow!("failed to attach {program_name}: {e}"))?;
+                        info!(
+                            program = program_name,
+                            "attached cgroup socket address program"
+                        );
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "BPF program {program_name} not found in ELF"
+                        ));
+                    }
+                }
+            }
+
             // cgroup/bind4 — IPv4 bind enforcement.
             match bpf.program_mut("ac_bind4") {
                 Some(prog) => {
                     let cg: &mut CgroupSockAddr = prog.try_into()?;
                     cg.load()?;
-                    match cg.attach(cgroup_fd, CgroupAttachMode::Single) {
-                        Ok(_link) => info!("attached ac_bind4 to cgroup bind4"),
-                        Err(e) => warn!(error = %e, "failed to attach ac_bind4 (non-fatal)"),
-                    }
+                    cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bind4: {e}"))?;
+                    info!("attached ac_bind4 to cgroup bind4");
                 }
-                None => warn!("BPF program ac_bind4 not found in ELF"),
+                None => return Err(anyhow::anyhow!("BPF program ac_bind4 not found in ELF")),
             }
 
             // cgroup/bind6 — IPv6 bind enforcement.
@@ -321,12 +348,11 @@ mod linux {
                 Some(prog) => {
                     let cg: &mut CgroupSockAddr = prog.try_into()?;
                     cg.load()?;
-                    match cg.attach(cgroup_fd, CgroupAttachMode::Single) {
-                        Ok(_link) => info!("attached ac_bind6 to cgroup bind6"),
-                        Err(e) => warn!(error = %e, "failed to attach ac_bind6 (non-fatal)"),
-                    }
+                    cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bind6: {e}"))?;
+                    info!("attached ac_bind6 to cgroup bind6");
                 }
-                None => warn!("BPF program ac_bind6 not found in ELF"),
+                None => return Err(anyhow::anyhow!("BPF program ac_bind6 not found in ELF")),
             }
 
             // ---------------------------------------------------------------

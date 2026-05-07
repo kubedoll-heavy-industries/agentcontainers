@@ -160,7 +160,7 @@ fn scoped_lpm_v6(cgroup_id: u64, addr: [u32; 4]) -> Key<ScopedLpmKeyV6> {
 pub fn ac_connect4(ctx: SockAddrContext) -> i32 {
     match try_connect4(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // Allow on error (fail-open for hooks)
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 
@@ -227,7 +227,7 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
 pub fn ac_connect6(ctx: SockAddrContext) -> i32 {
     match try_connect6(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // Allow on error (fail-open for hooks)
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 
