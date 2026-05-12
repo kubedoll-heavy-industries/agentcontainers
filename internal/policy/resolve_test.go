@@ -185,6 +185,23 @@ func TestResolve(t *testing.T) {
 			},
 		},
 		{
+			name: "network explicit empty egress keeps none mode",
+			caps: &config.Capabilities{
+				Network: &config.NetworkCaps{
+					Egress: []config.EgressRule{},
+					Deny:   []string{},
+				},
+			},
+			want: func(t *testing.T, p *ContainerPolicy) {
+				t.Helper()
+				if p.NetworkMode != "none" {
+					t.Errorf("NetworkMode = %q, want %q", p.NetworkMode, "none")
+				}
+				assertNilSlice(t, "AllowedHosts", p.AllowedHosts)
+				assertNilSlice(t, "AllowedEgressRules", p.AllowedEgressRules)
+			},
+		},
+		{
 			name: "network deny filters allowed hosts and egress rules",
 			caps: &config.Capabilities{
 				Network: &config.NetworkCaps{
