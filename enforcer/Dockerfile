@@ -72,8 +72,13 @@ RUN apt-get update && apt-get install -y \
 # platform-specific GCC toolchains or QEMU emulation.
 ARG ZIG_VERSION=0.15.2
 RUN ARCH=$(uname -m) && \
-    curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
-    | tar -xJ -C /usr/local && \
+    zig_archive="/tmp/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
+    curl --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 20 -fL \
+        "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+        -o "${zig_archive}" && \
+    tar -tJf "${zig_archive}" >/dev/null && \
+    tar -xJf "${zig_archive}" -C /usr/local && \
+    rm -f "${zig_archive}" && \
     ln -s "/usr/local/zig-${ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
 
 # Install cargo-zigbuild: uses Zig as the C linker for cross-compilation.
