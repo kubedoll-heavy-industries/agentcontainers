@@ -59,6 +59,8 @@ git clone https://github.com/Kubedoll-Heavy-Industries/agentcontainers
 cd agentcontainers
 mise install
 mise run build       # builds to tmp/agentcontainer
+mise run test        # runs the default Go test suite
+tmp/agentcontainer version
 ```
 
 Or install directly:
@@ -173,6 +175,19 @@ For the security model and threat analysis: [SECURITY.md](./SECURITY.md)
 
 ## Development
 
+First-time contributor smoke check:
+
+```bash
+mise install
+mise run build
+mise run test
+tmp/agentcontainer version
+```
+
+That path does not require privileged eBPF loading or any cloud credentials.
+Docker-backed dogfood, TypeScript testcontainers, and Rust/eBPF checks are
+separate tiers.
+
 ```bash
 mise run build          # build binary to tmp/agentcontainer
 mise run test           # go test -race ./...
@@ -204,6 +219,11 @@ Repository layout:
 | `internal/orgpolicy/` | Org policy extraction, merge, comparison |
 | `internal/secrets/` | Secret provider implementations |
 | `enforcer/` | Rust: agentcontainer-ebpf (Aya BPF), agentcontainer-enforcer (Tokio gRPC) |
+
+Good first contribution areas are schema/config tests, policy translation
+tests, CLI command tests, dojo/adversarial profile fixtures, examples, and
+docs. Coordinate with maintainers before changing the Rust/eBPF enforcer,
+runtime interfaces, schema shape, signing, org-policy, or secrets behavior.
 
 ---
 
