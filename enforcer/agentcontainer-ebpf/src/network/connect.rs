@@ -22,8 +22,7 @@
 //! Increments per-CPU stats on every decision.
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
 };
 use aya_ebpf::macros::cgroup_sock_addr;
 use aya_ebpf::maps::lpm_trie::Key;
@@ -37,7 +36,7 @@ use agentcontainer_common::maps::PortKeyV4;
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_PORTS, ALLOWED_V4, ALLOWED_V6, BLOCKED_CIDRS_V4, BLOCKED_CIDRS_V6,
-    CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, ENFORCED_CGROUPS, NET_EVENTS, NET_STATS,
+    CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, NET_EVENTS, NET_STATS,
 };
 
 // --- Inline helpers ---
@@ -119,12 +118,7 @@ fn emit_block_event_v6(dst_ip6: [u32; 4], dst_port: u16, proto: u8, event_type: 
 /// Check if the current cgroup is enforced. Returns Some(cgroup_id) if enforcement applies.
 #[inline(always)]
 fn get_enforced_cgroup() -> Option<u64> {
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    if unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_some() {
-        Some(cgroup_id)
-    } else {
-        None
-    }
+    crate::maps::enforced_cgroup_for_current()
 }
 
 // --- Event type constant ---

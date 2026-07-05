@@ -7,15 +7,14 @@
 //! logging so the enforcer can report the attempt.
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
 };
 use aya_ebpf::macros::tracepoint;
 use aya_ebpf::programs::TracePointContext;
 
 use agentcontainer_common::events::COMM_MAX;
 
-use crate::maps::{ENFORCED_CGROUPS, MEMFD_EVENTS};
+use crate::maps::MEMFD_EVENTS;
 
 // --- Event type constant ---
 
@@ -40,8 +39,7 @@ struct MemfdEvent {
 /// Check if the current cgroup is enforced.
 #[inline(always)]
 fn in_enforced_cgroup() -> bool {
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_some()
+    crate::maps::enforced_cgroup_for_current().is_some()
 }
 
 /// Emit a memfd block event to the MEMFD_EVENTS ring buffer.

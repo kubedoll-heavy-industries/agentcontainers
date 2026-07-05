@@ -11,8 +11,7 @@
 //!   5. If not found, emit BindEvent + bump stats + block.
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
 };
 use aya_ebpf::macros::cgroup_sock_addr;
 use aya_ebpf::programs::SockAddrContext;
@@ -22,7 +21,7 @@ use agentcontainer_common::maps::{BindKey, VERDICT_ALLOW, VERDICT_BLOCK};
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_BINDS, BIND_EVENTS, CGROUP_STAT_BIND_ALLOWED,
-    CGROUP_STAT_BIND_BLOCKED, ENFORCED_CGROUPS, NET_STATS,
+    CGROUP_STAT_BIND_BLOCKED, NET_STATS,
 };
 
 // --- Event type constant ---
@@ -45,12 +44,7 @@ fn bump_stat(idx: u32) {
 /// Check if the current cgroup is enforced. Returns Some(cgroup_id) if enforcement applies.
 #[inline(always)]
 fn get_enforced_cgroup() -> Option<u64> {
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    if unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_some() {
-        Some(cgroup_id)
-    } else {
-        None
-    }
+    crate::maps::enforced_cgroup_for_current()
 }
 
 /// Emit a bind block event to the BIND_EVENTS ring buffer.

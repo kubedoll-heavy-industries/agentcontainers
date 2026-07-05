@@ -10,15 +10,15 @@
 //! 6. In enforce mode, send SIGKILL via bpf_send_signal(9).
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_send_signal,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_send_signal,
 };
 use aya_ebpf::macros::kprobe;
 use aya_ebpf::programs::ProbeContext;
 
 use agentcontainer_common::events::{ReverseShellEvent, COMM_MAX};
 
-use crate::maps::{ENFORCED_CGROUPS, REVERSE_SHELL_EVENTS, REVERSE_SHELL_MODE};
+use crate::maps::{REVERSE_SHELL_EVENTS, REVERSE_SHELL_MODE};
 
 // ---------------------------------------------------------------------------
 // Reverse shell mode constants
@@ -61,8 +61,7 @@ const KNOWN_SHELLS: [[u8; COMM_MAX]; 9] = [
 /// Check if the current cgroup is enforced. Returns true if enforcement applies.
 #[inline(always)]
 fn is_enforced_cgroup() -> bool {
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_some()
+    crate::maps::enforced_cgroup_for_current().is_some()
 }
 
 /// Compare two comm buffers byte-by-byte up to the first null in `pattern`.
