@@ -98,6 +98,8 @@ pub struct ExecEvent {
     pub uid: u32,
     pub event_type: u32,
     pub verdict: u32,
+    /// Cgroup (container) the exec was authorized in — scopes the audit trail.
+    pub cgroup_id: u64,
     pub inode: u64,
     pub comm: [u8; COMM_MAX],
     pub binary: [u8; PATH_MAX],

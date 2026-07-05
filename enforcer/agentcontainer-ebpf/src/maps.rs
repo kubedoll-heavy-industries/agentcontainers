@@ -10,8 +10,8 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    CgroupStats, DenySetKey, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4, ScopedLpmKeyV6,
-    ScopedPortKeyV4, SecretAclKey, SecretAclValue,
+    CgroupStats, DenySetKey, KernelOffsets, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4,
+    ScopedLpmKeyV6, ScopedPortKeyV4, SecretAclKey, SecretAclValue,
 };
 use agentcontainer_common::siphash::SipHashKey;
 
@@ -64,6 +64,14 @@ pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
 pub fn enforced_cgroup_for_current() -> Option<u64> {
     enforced_cgroup_flags_for_current().map(|(id, _)| id)
 }
+
+// --- Kernel field offsets (CO-RE substitute) ---
+
+/// Single-entry array: BTF-resolved kernel struct field offsets for LSM hooks.
+/// Userspace populates index 0 before attach; hooks fail-closed if absent.
+#[map]
+pub static KERNEL_OFFSETS: Array<KernelOffsets> = Array::with_max_entries(1, 0);
+
 
 // --- Network maps ---
 

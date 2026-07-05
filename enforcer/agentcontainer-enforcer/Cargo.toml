@@ -29,6 +29,7 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 openinference-semantic-conventions = { workspace = true, optional = true }
 openinference-instrumentation = { workspace = true, optional = true }
+btf-rs = "2.0.0"
 
 # Linux-only: BPF loader and log integration.
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -442,6 +442,7 @@ mod tests {
             uid: 0,
             event_type: bpf::EventType::ProcessExec as u32,
             verdict: bpf::Verdict::Block as u32,
+            cgroup_id: 0,
             inode: 99999,
             comm,
             binary,
