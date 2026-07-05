@@ -141,7 +141,7 @@ mod linux {
         /// older kernels), a warning is logged but startup continues. Only
         /// critical failures (e.g., unable to open the root cgroup) are fatal.
         fn attach_programs(bpf: &mut Ebpf) -> anyhow::Result<()> {
-            use aya::programs::{CgroupSockAddr, KProbe, TracePoint};
+            use aya::programs::{CgroupAttachMode, CgroupSockAddr, KProbe, TracePoint};
             use std::os::fd::AsFd;
 
             // Open the root cgroup v2 hierarchy for cgroup-attached programs.
@@ -206,7 +206,7 @@ mod linux {
                 Some(prog) => {
                     let cg: &mut CgroupSockAddr = prog.try_into()?;
                     cg.load()?;
-                    match cg.attach(cgroup_fd) {
+                    match cg.attach(cgroup_fd, CgroupAttachMode::Single) {
                         Ok(_link) => info!("attached ac_bind4 to cgroup bind4"),
                         Err(e) => warn!(error = %e, "failed to attach ac_bind4 (non-fatal)"),
                     }
@@ -219,7 +219,7 @@ mod linux {
                 Some(prog) => {
                     let cg: &mut CgroupSockAddr = prog.try_into()?;
                     cg.load()?;
-                    match cg.attach(cgroup_fd) {
+                    match cg.attach(cgroup_fd, CgroupAttachMode::Single) {
                         Ok(_link) => info!("attached ac_bind6 to cgroup bind6"),
                         Err(e) => warn!(error = %e, "failed to attach ac_bind6 (non-fatal)"),
                     }
