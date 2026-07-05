@@ -36,8 +36,9 @@ mod linux {
     };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        BindKey, CgroupStats, DenySetKey, FsInodeKey, PortKeyV4, SecretAclKey, SecretAclValue,
-        FS_PERM_READ, FS_PERM_WRITE,
+        BindKey, CgroupStats, DenySetKey, FsInodeKey, KernelOffsets, PortKeyV4, SecretAclKey,
+        SecretAclValue, CGROUP_FLAG_ENFORCED, CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ,
+        FS_PERM_WRITE,
     };
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
@@ -114,6 +115,11 @@ mod linux {
             }
 
             info!("BPF programs loaded successfully");
+
+            // Resolve and publish kernel struct field offsets from BTF BEFORE any
+            // program is attached. Fatal on failure (fail-closed): without correct
+            // offsets the LSM hooks cannot verify executable/file identity.
+            Self::populate_kernel_offsets(&mut bpf)?;
 
             // Attach programs to their kernel hook points.
             Self::attach_programs(&mut bpf)?;
@@ -461,6 +467,67 @@ mod linux {
             )
         }
 
+        /// Resolve the kernel struct field byte-offsets the LSM hooks need from
+        /// the running kernel's BTF. Portable across kernel versions — the Rust
+        /// eBPF toolchain emits no CO-RE relocations, so the eBPF side reads
+        /// `base + offset` using these instead of hardcoded `#[repr(C)]` mirrors.
+        fn resolve_kernel_offsets() -> anyhow::Result<KernelOffsets> {
+            use btf_rs::Type;
+            let btf = btf_rs::Btf::from_file("/sys/kernel/btf/vmlinux").map_err(|e| {
+                anyhow::anyhow!("loading kernel BTF (/sys/kernel/btf/vmlinux): {e}")
+            })?;
+            let byte_off = |strct: &str, field: &str| -> anyhow::Result<u32> {
+                let types = btf
+                    .resolve_types_by_name(strct)
+                    .map_err(|e| anyhow::anyhow!("BTF lookup for struct {strct}: {e}"))?;
+                for t in types {
+                    let s = match t {
+                        Type::Struct(s) | Type::Union(s) => s,
+                        _ => continue,
+                    };
+                    for m in &s.members {
+                        let name = btf
+                            .resolve_name(m)
+                            .map_err(|e| anyhow::anyhow!("BTF member name in {strct}: {e}"))?;
+                        if name == field {
+                            if m.bitfield_size().unwrap_or(0) != 0 {
+                                anyhow::bail!("{strct}.{field} is a bitfield (unsupported)");
+                            }
+                            return Ok(m.bit_offset() / 8);
+                        }
+                    }
+                }
+                anyhow::bail!("{strct}.{field} not found in kernel BTF")
+            };
+            Ok(KernelOffsets {
+                binprm_file: byte_off("linux_binprm", "file")?,
+                file_f_inode: byte_off("file", "f_inode")?,
+                file_f_path: byte_off("file", "f_path")?,
+                file_f_flags: byte_off("file", "f_flags")?,
+                path_dentry: byte_off("path", "dentry")?,
+                dentry_d_name: byte_off("dentry", "d_name")?,
+                qstr_name: byte_off("qstr", "name")?,
+                inode_i_ino: byte_off("inode", "i_ino")?,
+                inode_i_sb: byte_off("inode", "i_sb")?,
+                sb_s_dev: byte_off("super_block", "s_dev")?,
+                sb_s_magic: byte_off("super_block", "s_magic")?,
+            })
+        }
+
+        /// Populate the single-entry KERNEL_OFFSETS array map from BTF, before
+        /// any program is attached. A failure here is fatal: without correct
+        /// offsets the LSM hooks cannot verify executable/file identity.
+        fn populate_kernel_offsets(bpf: &mut Ebpf) -> anyhow::Result<()> {
+            let offsets = Self::resolve_kernel_offsets()?;
+            let map = bpf
+                .map_mut("KERNEL_OFFSETS")
+                .ok_or_else(|| anyhow::anyhow!("BPF map KERNEL_OFFSETS not found"))?;
+            let mut arr: aya::maps::Array<_, KernelOffsets> = aya::maps::Array::try_from(map)?;
+            arr.set(0, offsets, 0)?;
+            info!(?offsets, "resolved kernel struct offsets from BTF");
+            Ok(())
+        }
+
         /// Resolve a cgroup filesystem path to a cgroup ID (inode number).
         fn resolve_cgroup_id(cgroup_path: &str) -> anyhow::Result<u64> {
             let meta = std::fs::metadata(cgroup_path)
@@ -500,7 +567,11 @@ mod linux {
                     bpf.map_mut("ENFORCED_CGROUPS")
                         .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?,
                 )?;
-                map.insert(cgroup_id, 1, 0)?;
+                // Register with the ENFORCED flag; the EXEC_ENFORCED flag is
+                // OR-ed in later by apply_process when a non-empty exec
+                // allowlist is applied. Other hooks read this map via
+                // `.is_some()` and ignore the value, so a nonzero flag is safe.
+                map.insert(cgroup_id, CGROUP_FLAG_ENFORCED, 0)?;
             }
 
             // Track in registry for event correlation.
@@ -673,6 +744,7 @@ mod linux {
                             inode,
                             dev_major,
                             dev_minor,
+                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
@@ -696,6 +768,7 @@ mod linux {
                             inode,
                             dev_major,
                             dev_minor,
+                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
@@ -724,6 +797,7 @@ mod linux {
 
             let mut bpf = self.programs.lock().unwrap();
 
+            let mut resolved_any = false;
             for binary in &policy.allowed_binaries {
                 match Self::resolve_inode(binary) {
                     Ok((inode, dev_major, dev_minor)) => {
@@ -731,6 +805,7 @@ mod linux {
                             inode,
                             dev_major,
                             dev_minor,
+                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_EXECS")
@@ -738,12 +813,34 @@ mod linux {
                         let mut map: AyaHashMap<_, FsInodeKey, u8> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, 1, 0)?;
+                        resolved_any = true;
                         info!(binary, inode, "added binary inode to ALLOWED_EXECS");
                     }
                     Err(e) => {
                         warn!(binary, error = %e, "failed to resolve binary inode, skipping");
                     }
                 }
+            }
+
+            // Toggle the exec-enforcement flag on this cgroup. bprm_check is an
+            // allowlist: gating a cgroup with an EMPTY allowlist would deny ALL
+            // execs. So exec enforcement is opt-in — set EXEC_ENFORCED only when
+            // at least one binary was applied; clear it otherwise so a cgroup
+            // with no declared binaries (e.g. a proxy-launched tool-runner
+            // backend that must spawn its own processes) is not exec-gated.
+            // Network/filesystem enforcement is unaffected (the ENFORCED bit stays set).
+            {
+                let map_data = bpf
+                    .map_mut("ENFORCED_CGROUPS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?;
+                let mut emap: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(map_data)?;
+                let cur = emap.get(&cgroup_id, 0).unwrap_or(CGROUP_FLAG_ENFORCED);
+                let new = if resolved_any {
+                    cur | CGROUP_FLAG_EXEC_ENFORCED
+                } else {
+                    cur & !CGROUP_FLAG_EXEC_ENFORCED
+                };
+                emap.insert(cgroup_id, new, 0)?;
             }
 
             Ok(())

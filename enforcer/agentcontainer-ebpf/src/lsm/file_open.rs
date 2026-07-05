@@ -23,56 +23,29 @@ use agentcontainer_common::events::{
     CRED_REASON_WRITE_DENIED, EVENT_CRED_OPEN,
 };
 use agentcontainer_common::maps::{
-    FsInodeKey, SecretAclKey, DENTRY_NAME_LEN, FS_PERM_WRITE, LSM_ALLOW, LSM_DENY, PROC_SUPER_MAGIC,
+    FsInodeKey, KernelOffsets, SecretAclKey, DENTRY_NAME_LEN, FS_PERM_WRITE, LSM_ALLOW, LSM_DENY,
+    PROC_SUPER_MAGIC,
 };
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_INODES, CGROUP_STAT_CRED_ALLOWED, CGROUP_STAT_CRED_BLOCKED,
     CGROUP_STAT_FS_ALLOWED, CGROUP_STAT_FS_BLOCKED, CRED_EVENTS, CRED_STATS, DENIED_INODES,
-    FS_EVENTS, FS_STATS, SECRET_ACLS,
+    FS_EVENTS, FS_STATS, KERNEL_OFFSETS, SECRET_ACLS,
 };
 
 // ---------------------------------------------------------------------------
-// Minimal kernel struct declarations for BPF CO-RE reads.
-// Only fields we actually access are declared; layout matches the kernel's
-// struct layout at the offsets we need.
+// Kernel struct fields are read at BTF-resolved byte offsets (KERNEL_OFFSETS),
+// not hardcoded `#[repr(C)]` mirrors — the Rust eBPF toolchain emits no CO-RE
+// relocations, so fixed offsets break across kernel versions. The inode comes
+// from `file->f_inode` (stable since v3.9); the dentry (for the /proc/*/environ
+// name check) still comes via `file->f_path.dentry`.
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
-struct File {
-    f_path: Path,
-}
-
-#[repr(C)]
-struct Path {
-    _mnt: *const u8,
-    dentry: *const Dentry,
-}
-
-#[repr(C)]
-struct Dentry {
-    d_inode: *const Inode,
-    _d_parent: *const Dentry,
-    d_name: Qstr,
-}
-
-#[repr(C)]
-struct Qstr {
-    _len: u32,
-    name: *const u8,
-}
-
-#[repr(C)]
-struct Inode {
-    i_ino: u64,
-    i_sb: *const SuperBlock,
-}
-
-#[repr(C)]
-struct SuperBlock {
-    s_dev: u32,
-    _pad: u32,
-    s_magic: u64,
+/// Read a `T` from `base + off` in kernel memory. `off` is a BTF-resolved byte
+/// offset from KERNEL_OFFSETS.
+#[inline(always)]
+unsafe fn read_at<T>(base: *const u8, off: u32) -> Result<T, i64> {
+    bpf_probe_read_kernel(base.add(off as usize) as *const T)
 }
 
 // ---------------------------------------------------------------------------
@@ -165,40 +138,27 @@ fn emit_cred_block_event(inode_nr: u64, cgid: u64, reason: u32) {
 /// HIGH-2 limitation: Bypassable via symlinks pointing to /proc/*/environ.
 /// Mitigated by read-only rootfs and process enforcer restrictions.
 #[inline(always)]
-unsafe fn is_proc_environ(file_ptr: *const File) -> bool {
-    // Read the dentry pointer from file->f_path.dentry.
-    let dentry_ptr: *const Dentry =
-        match bpf_probe_read_kernel(&(*file_ptr).f_path.dentry as *const _ as *const *const Dentry)
-        {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-    if dentry_ptr.is_null() {
-        return false;
-    }
-
-    // Read the inode pointer from dentry->d_inode.
-    let inode_ptr: *const Inode =
-        match bpf_probe_read_kernel(&(*dentry_ptr).d_inode as *const _ as *const *const Inode) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+unsafe fn is_proc_environ(file_ptr: *const u8, offs: &KernelOffsets) -> bool {
+    // Inode via file->f_inode → i_sb → s_magic; only procfs proceeds.
+    let inode_ptr: *const u8 = match read_at(file_ptr, offs.file_f_inode) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
     if inode_ptr.is_null() {
         return false;
     }
 
     // Read the superblock pointer from inode->i_sb.
-    let sb_ptr: *const SuperBlock =
-        match bpf_probe_read_kernel(&(*inode_ptr).i_sb as *const _ as *const *const SuperBlock) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+    let sb_ptr: *const u8 = match read_at(inode_ptr, offs.inode_i_sb) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
     if sb_ptr.is_null() {
         return false;
     }
 
     // Check filesystem magic -- only proceed if this is procfs.
-    let s_magic: u64 = match bpf_probe_read_kernel(&(*sb_ptr).s_magic as *const u64) {
+    let s_magic: u64 = match read_at(sb_ptr, offs.sb_s_magic) {
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -206,12 +166,19 @@ unsafe fn is_proc_environ(file_ptr: *const File) -> bool {
         return false;
     }
 
-    // Read the dentry name pointer from dentry->d_name.name.
-    let name_ptr: *const u8 =
-        match bpf_probe_read_kernel(&(*dentry_ptr).d_name.name as *const _ as *const *const u8) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+    // Dentry name via file->f_path.dentry->d_name.name (d_name is an embedded
+    // qstr, so its `name` pointer is at d_name + qstr.name).
+    let dentry_ptr: *const u8 = match read_at(file_ptr, offs.file_f_path + offs.path_dentry) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if dentry_ptr.is_null() {
+        return false;
+    }
+    let name_ptr: *const u8 = match read_at(dentry_ptr, offs.dentry_d_name + offs.qstr_name) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
     if name_ptr.is_null() {
         return false;
     }
@@ -269,14 +236,22 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // 0. Cgroup scoping: only enforce for processes in target containers.
     //    LSM hooks are system-wide; skip all non-container processes.
     // Subtree match: a task moved into a descendant of an enforced cgroup stays
-    // governed by that ancestor, closing the child-cgroup escape.
+    // governed by that ancestor (its inode maps/stats), closing the child-cgroup
+    // escape. `cgid` is the enforced ancestor's id.
     let cgid = match crate::maps::enforced_cgroup_for_current() {
         Some(id) => id,
         None => return Ok(LSM_ALLOW),
     };
 
+    // BTF-resolved field offsets. Absent means userspace failed to populate them;
+    // file_open's error policy is fail-open (matches the `Err` arm below).
+    let offs = match KERNEL_OFFSETS.get(0) {
+        Some(o) => o,
+        None => return Ok(LSM_ALLOW),
+    };
+
     // Get the file pointer from the LSM hook argument.
-    let file_ptr: *const File = unsafe { ctx.arg::<*const File>(0) };
+    let file_ptr: *const u8 = unsafe { ctx.arg::<*const u8>(0) };
     if file_ptr.is_null() {
         return Ok(LSM_ALLOW);
     }
@@ -284,29 +259,15 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // 1. Check for /proc/*/environ -- always block to protect credentials.
     //    Procfs inodes are dynamic and cannot be predicted at attach time,
     //    so we use dentry name matching on procfs filesystems (CRED-1 fix).
-    if unsafe { is_proc_environ(file_ptr) } {
+    if unsafe { is_proc_environ(file_ptr, offs) } {
         bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
         emit_fs_block_event(0, 0);
         return Ok(LSM_DENY);
     }
 
-    // Read the dentry pointer from file->f_path.dentry.
-    let dentry_ptr: *const Dentry = unsafe {
-        bpf_probe_read_kernel(&(*file_ptr).f_path.dentry as *const _ as *const *const Dentry)
-            .map_err(|e| e)?
-    };
-    if dentry_ptr.is_null() {
-        bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
-        bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
-        return Ok(LSM_ALLOW);
-    }
-
-    // Read the inode from the file's dentry.
-    let inode_ptr: *const Inode = unsafe {
-        bpf_probe_read_kernel(&(*dentry_ptr).d_inode as *const _ as *const *const Inode)
-            .map_err(|e| e)?
-    };
+    // Read the inode via file->f_inode (stable since v3.9 — no dentry walk).
+    let inode_ptr: *const u8 = unsafe { read_at(file_ptr, offs.file_f_inode)? };
     if inode_ptr.is_null() {
         bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
@@ -314,31 +275,20 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     }
 
     // Read inode number.
-    let ino: u64 =
-        unsafe { bpf_probe_read_kernel(&(*inode_ptr).i_ino as *const u64).map_err(|e| e)? };
+    let ino: u64 = unsafe { read_at(inode_ptr, offs.inode_i_ino)? };
 
-    // Read file flags. f_flags is after f_path in struct file.
-    // We use the BPF raw helper to read at the right offset.
-    // In the kernel, struct file { struct path f_path; unsigned int f_flags; ... }
-    // struct path is 2 pointers (16 bytes on 64-bit), so f_flags is at offset 16.
-    let flags: u32 = unsafe {
-        let flags_ptr = (file_ptr as *const u8).add(core::mem::size_of::<Path>()) as *const u32;
-        bpf_probe_read_kernel(flags_ptr).map_err(|e| e)?
-    };
+    // Read file flags (file.f_flags) at its BTF-resolved offset.
+    let flags: u32 = unsafe { read_at(file_ptr, offs.file_f_flags)? };
 
     // Read the superblock to get the device number.
-    let sb_ptr: *const SuperBlock = unsafe {
-        bpf_probe_read_kernel(&(*inode_ptr).i_sb as *const _ as *const *const SuperBlock)
-            .map_err(|e| e)?
-    };
+    let sb_ptr: *const u8 = unsafe { read_at(inode_ptr, offs.inode_i_sb)? };
     if sb_ptr.is_null() {
         bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
         return Ok(LSM_ALLOW);
     }
 
-    let s_dev: u32 =
-        unsafe { bpf_probe_read_kernel(&(*sb_ptr).s_dev as *const u32).map_err(|e| e)? };
+    let s_dev: u32 = unsafe { read_at(sb_ptr, offs.sb_s_dev)? };
 
     // Build lookup key with actual device numbers.
     // Linux dev_t: MAJOR(dev) = (dev >> 20) & 0xfff, MINOR(dev) = dev & 0xfffff
@@ -346,6 +296,8 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         inode: ino,
         dev_major: (s_dev >> 20) & 0xfff,
         dev_minor: s_dev & 0xfffff,
+        // FsInodeKey is now cgroup-scoped; use this hook's own exact-match cgid.
+        cgroup_id: cgid,
     };
 
     // 2a. Credential enforcement: check SECRET_ACLS for per-cgroup secret access.

@@ -10,7 +10,8 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    BindKey, CgroupStats, DenySetKey, FsInodeKey, PortKeyV4, SecretAclKey, SecretAclValue,
+    BindKey, CgroupStats, DenySetKey, FsInodeKey, KernelOffsets, PortKeyV4, SecretAclKey,
+    SecretAclValue,
 };
 use agentcontainer_common::siphash::SipHashKey;
 
@@ -106,6 +107,15 @@ pub static NET_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 /// BPF programs read it to hash domain names identically.
 #[map]
 pub static SIPHASH_KEY: Array<SipHashKey> = Array::with_max_entries(1, 0);
+
+// --- Kernel struct offsets (CO-RE substitute) ---
+
+/// Kernel struct field byte-offsets, resolved from BTF and populated by
+/// userspace at startup (before any program is attached). The LSM hooks read
+/// index 0 to walk `linux_binprm`/`file`/`inode`/`super_block` portably across
+/// kernel versions instead of via hardcoded offsets. See [`KernelOffsets`].
+#[map]
+pub static KERNEL_OFFSETS: Array<KernelOffsets> = Array::with_max_entries(1, 0);
 
 /// Set of tracked domain hashes. Userspace inserts SipHash-128 digests of
 /// domains it cares about (from the network policy allowed_hosts list).

@@ -55,6 +55,7 @@ fn test_exec_event_has_binary_path() {
         uid: 0,
         event_type: EventType::ProcessExec as u32,
         verdict: Verdict::Block as u32,
+        cgroup_id: 0,
         inode: 42,
         comm: [0u8; COMM_MAX],
         binary: [0u8; PATH_MAX],
