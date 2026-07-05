@@ -1,0 +1,57 @@
+# Build + run the privileged BPF integration suite (tests/bpf_integration.rs) as
+# a container image, for use as a Kubernetes Job on a BPF-capable node (see
+# deploy/bpf-integration-job.yaml). Unlike the production Dockerfile this carries
+# the TEST binary, not the enforcer daemon. Native build (no cross): the test
+# binary must match the node's kernel/arch.
+#
+#   docker build -f enforcer/Dockerfile.test -t <ref> enforcer/
+#
+# Build context is enforcer/ (the Rust workspace root), matching Dockerfile.
+
+FROM rust:1.93-bookworm AS builder
+
+# Same BPF/proto build deps as the production Dockerfile's builder stage.
+RUN apt-get update && apt-get install -y \
+      clang \
+      llvm \
+      libelf-dev \
+      linux-headers-generic \
+      protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Nightly + rust-src + bpf-linker drive the aya-build BPF compilation in build.rs.
+RUN rustup toolchain install nightly --component rust-src \
+    && rustup run nightly cargo install bpf-linker
+
+WORKDIR /build
+COPY . .
+
+# Compile the integration test binary AND the aya-build BPF ELF (link only —
+# the privileged run happens in the pod). Mirrors .github/workflows/bpf-integration.yml.
+RUN cargo test -p agentcontainer-enforcer --test bpf_integration --no-run
+
+# Stage the freshly linked test binary + the newest aya-build ELF at fixed paths
+# (the test binary carries a content hash; locate it the same way CI does).
+RUN mkdir -p /out \
+    && cp "$(ls -t target/debug/deps/bpf_integration-* | grep -v '\.d$' | head -1)" /out/bpf_integration \
+    && find target -name 'agentcontainer-ebpf-progs' -path '*/out/*' | head -1 \
+       | xargs -I{} cp {} /out/agentcontainer-ebpf-progs \
+    && test -x /out/bpf_integration && test -f /out/agentcontainer-ebpf-progs
+
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim
+
+# libelf1 is required by aya to load BPF programs at runtime.
+RUN apt-get update && apt-get install -y libelf1 && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/bpf_integration /usr/local/bin/bpf_integration
+COPY --from=builder /out/agentcontainer-ebpf-progs /usr/lib/agentcontainer-enforcer/agentcontainer-ebpf-progs
+
+# Highest-priority ELF source for the test's load_bpf_elf() (over aya-build OUT_DIR,
+# which does not exist in this slim runtime).
+ENV AC_BPF_ELF_PATH=/usr/lib/agentcontainer-enforcer/agentcontainer-ebpf-progs
+
+# serial_test serializes these, but the suite binds fixed ports (UDP :53) and
+# shares the cgroup root — force single-threaded, mirroring CI. --nocapture
+# surfaces the per-test output (incl. the IPv6 self-skip) in `kubectl logs`.
+ENTRYPOINT ["/usr/local/bin/bpf_integration", "--test-threads=1", "--nocapture"]

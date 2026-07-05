@@ -1,0 +1,66 @@
+# Privileged Kubernetes Job that runs the enforcer's BPF integration suite
+# (tests/bpf_integration.rs) on a real kernel — the validation path for changes
+# that load/attach eBPF programs (e.g. G4 transient egress), which GitHub-hosted
+# runners can't do. Build + push the image first (see Dockerfile.test):
+#
+#   docker build -f enforcer/Dockerfile.test -t <registry>/ac-enforcer-bpf-test:<tag> enforcer/
+#   docker push <registry>/ac-enforcer-bpf-test:<tag>
+#   sed 's#REPLACE_WITH_IMAGE#<registry>/ac-enforcer-bpf-test:<tag>#' \
+#     enforcer/deploy/bpf-integration-job.yaml | kubectl apply -f -
+#   kubectl wait --for=condition=complete --timeout=300s job/ac-enforcer-bpf-integration
+#   kubectl logs -f job/ac-enforcer-bpf-integration
+#   kubectl delete job ac-enforcer-bpf-integration
+#
+# Requirements on the scheduled node: cgroup v2, and a kernel that permits
+# cgroup-BPF program load/attach. LSM-dependent tests self-skip without
+# CONFIG_BPF_LSM; the network/egress tests (incl. transient egress) run and are
+# the regression net. If the pod's cgroup namespace prevents attach or own-cgroup
+# resolution, run on a node that allows a host cgroup view for the pod.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ac-enforcer-bpf-integration
+  labels:
+    app: agentcontainer-enforcer
+    component: bpf-integration-test
+spec:
+  backoffLimit: 0 # a real test failure should not be retried
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: agentcontainer-enforcer
+        component: bpf-integration-test
+    spec:
+      restartPolicy: Never
+      hostPID: true
+      containers:
+        - name: bpf-integration
+          image: REPLACE_WITH_IMAGE
+          imagePullPolicy: Always # re-pull when a tag is rebuilt (test iteration)
+          securityContext:
+            privileged: true # BPF map/program load + attach are root+CAP_BPF/SYS_ADMIN
+            # If --privileged is disallowed by policy, drop it and grant explicitly:
+            # capabilities:
+            #   add: ["BPF", "PERFMON", "NET_ADMIN", "SYS_ADMIN", "SYS_RESOURCE"]
+          volumeMounts:
+            - name: cgroup
+              mountPath: /sys/fs/cgroup # rw: the suite registers/attaches cgroups
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf # directory of vmlinux + per-module BTF
+            type: Directory
