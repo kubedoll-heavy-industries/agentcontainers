@@ -12,8 +12,8 @@
 //! Increments per-CPU stats on every decision.
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_probe_read_kernel,
 };
 use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
@@ -30,7 +30,7 @@ use agentcontainer_common::maps::{
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_INODES, CGROUP_STAT_CRED_ALLOWED, CGROUP_STAT_CRED_BLOCKED,
     CGROUP_STAT_FS_ALLOWED, CGROUP_STAT_FS_BLOCKED, CRED_EVENTS, CRED_STATS, DENIED_INODES,
-    ENFORCED_CGROUPS, FS_EVENTS, FS_STATS, SECRET_ACLS,
+    FS_EVENTS, FS_STATS, SECRET_ACLS,
 };
 
 // ---------------------------------------------------------------------------
@@ -275,11 +275,12 @@ pub fn ac_file_open(ctx: LsmContext) -> i32 {
 fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // 0. Cgroup scoping: only enforce for processes in target containers.
     //    LSM hooks are system-wide; skip all non-container processes.
-    let cgid = unsafe { bpf_get_current_cgroup_id() };
-    let in_enforced = unsafe { ENFORCED_CGROUPS.get(&cgid) };
-    if in_enforced.is_none() {
-        return Ok(LSM_ALLOW);
-    }
+    // Subtree match: a task moved into a descendant of an enforced cgroup stays
+    // governed by that ancestor, closing the child-cgroup escape.
+    let cgid = match crate::maps::enforced_cgroup_for_current() {
+        Some(id) => id,
+        None => return Ok(LSM_ALLOW),
+    };
 
     // Get the file pointer from the LSM hook argument.
     let file_ptr: *const File = unsafe { ctx.arg::<*const File>(0) };

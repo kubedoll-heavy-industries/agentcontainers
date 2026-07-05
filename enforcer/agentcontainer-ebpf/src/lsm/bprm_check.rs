@@ -9,8 +9,8 @@
 //! Ported from C implementation in internal/ebpf/bpf/lsm/bprm_check.c.
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_probe_read_kernel,
 };
 use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
@@ -24,7 +24,7 @@ use agentcontainer_common::maps::{DenySetKey, ScopedFsInodeKey, LSM_ALLOW, LSM_D
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_DENYSET_ALLOWED, CGROUP_STAT_DENYSET_BLOCKED,
     CGROUP_STAT_PROC_ALLOWED, CGROUP_STAT_PROC_BLOCKED, DENY_SET_POLICY, DENY_SET_TRANSITIONS,
-    ENFORCED_CGROUPS, PROC_DENY_SETS, PROC_EVENTS, PROC_STATS,
+    PROC_DENY_SETS, PROC_EVENTS, PROC_STATS,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,12 +89,9 @@ fn bump_stat(idx: u32) {
 /// Check if the current cgroup is enforced. Returns Some(cgroup_id) if enforcement applies.
 #[inline(always)]
 fn get_enforced_cgroup() -> Option<u64> {
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    if unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_some() {
-        Some(cgroup_id)
-    } else {
-        None
-    }
+    // Subtree match: a task moved into a descendant of an enforced cgroup stays
+    // governed by that ancestor, closing the child-cgroup escape.
+    crate::maps::enforced_cgroup_for_current()
 }
 
 /// Emit a block event for a denied process execution to the PROC_EVENTS ring buffer.

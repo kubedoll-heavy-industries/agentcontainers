@@ -30,10 +30,8 @@ use agentcontainer_common::maps::{
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_PORTS, ALLOWED_V4, ALLOWED_V6, BLOCKED_CIDRS_V4, BLOCKED_CIDRS_V6,
-    CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, ENFORCED_CGROUPS, NET_EVENTS, NET_STATS,
+    CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, NET_EVENTS, NET_STATS,
 };
-
-use aya_ebpf::helpers::bpf_get_current_cgroup_id;
 
 /// Event type for sendmsg hooks (matches C AC_EVENT_NET_SENDMSG = 2).
 const EVENT_NET_SENDMSG: u32 = 2;
@@ -62,12 +60,7 @@ fn scoped_lpm_v6(cgroup_id: u64, addr: [u32; 4]) -> Key<ScopedLpmKeyV6> {
 /// Get the cgroup_id if the current cgroup is enforced, or None.
 #[inline(always)]
 fn get_enforced_cgroup() -> Option<u64> {
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    if unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_some() {
-        Some(cgroup_id)
-    } else {
-        None
-    }
+    crate::maps::enforced_cgroup_for_current()
 }
 
 // ---------------------------------------------------------------------------
