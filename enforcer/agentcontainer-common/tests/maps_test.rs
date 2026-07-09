@@ -38,9 +38,10 @@ fn test_scoped_port_key_v4_layout() {
 
 #[test]
 fn test_fs_inode_key_layout() {
-    // 24 bytes: inode(8) + dev_major(4) + dev_minor(4) + cgroup_id(8).
-    // cgroup_id scopes every inode authorization to a single container.
-    assert_eq!(mem::size_of::<FsInodeKey>(), 24);
+    // Unscoped: inode(8) + dev_major(4) + dev_minor(4) = 16.
+    assert_eq!(mem::size_of::<FsInodeKey>(), 16);
+    // Scoped: inode(8) + cgroup_id(8) + dev_major(4) + dev_minor(4) = 24.
+    assert_eq!(mem::size_of::<ScopedFsInodeKey>(), 24);
 }
 
 #[test]
