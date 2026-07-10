@@ -11,7 +11,7 @@ use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBu
 
 use agentcontainer_common::maps::{
     CgroupStats, DenySetKey, KernelOffsets, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4,
-    ScopedLpmKeyV6, ScopedPortKeyV4, SecretAclKey, SecretAclValue,
+    ScopedLpmKeyV6, ScopedPortKeyV4, SecretAclKey, SecretAclValue, CGROUP_FLAG_ENFORCED,
 };
 use agentcontainer_common::siphash::SipHashKey;
 
@@ -26,18 +26,23 @@ pub static ENFORCED_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0
 /// bound keeps the walk verifier-friendly.
 pub const MAX_CGROUP_DEPTH: i32 = 16;
 
-/// The enforced cgroup (id + its policy flags) governing the current task: its
-/// own cgroup if directly registered, otherwise the nearest ancestor present in
-/// `ENFORCED_CGROUPS` (SUBTREE match). Returning the registered ancestor means a
-/// task moved into a descendant cgroup — `mkdir <enforced>/x; echo $$ >
-/// x/cgroup.procs`, the Escape-the-Box T11 vector — stays governed by that
-/// ancestor's policy/stats/inode maps instead of escaping enforcement. `None`
-/// when neither the task nor any ancestor is enforced.
+/// The enforced cgroup (id + its policy flags) governing the current task.
 ///
-/// Perf: the fast path is one lookup for a directly-registered cgroup (the
-/// normal container case). Only tasks NOT directly enforced pay the bounded
-/// ancestor walk — including unenforced host processes on the system-wide LSM
-/// hooks.
+/// Lookup order (closed domain):
+/// 1. Exact `cgroup_id` in `ENFORCED_CGROUPS` (normal container leaf/root).
+/// 2. Bounded ancestor walk — task in a **descendant** of a registered cgroup
+///    (T11 child-cgroup escape: `mkdir <enforced>/x; echo $$ > x/cgroup.procs`).
+/// 3. Process-tree sticky map `PROC_ENFORCED` — task (or its ancestor process)
+///    was seeded at container register / fork inheritance. Closes **sibling**
+///    and non-ancestor cgroup moves (e.g. in-container cron/systemd scopes that
+///    are not under the registered leaf in the cgroup tree).
+///
+/// Host processes that were never registered return `None` so system-wide LSM
+/// hooks stay no-ops outside agent containers.
+///
+/// Perf: direct cgroup hit is one map lookup. Ancestor walk and PID sticky are
+/// only paid on miss (unregistered host tasks pay the walk; sticky is one more
+/// lookup after that).
 #[inline(always)]
 pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
     let cgid = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
@@ -55,6 +60,16 @@ pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
             return Some((id, flags));
         }
     }
+    // Process-tree sticky: pid → governing cgroup_id (seeded at register, inherited on fork).
+    let pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    if let Some(&gov_cgid) = unsafe { PROC_ENFORCED.get(&pid) } {
+        if let Some(&flags) = unsafe { ENFORCED_CGROUPS.get(&gov_cgid) } {
+            return Some((gov_cgid, flags));
+        }
+        // Governing cgroup was unregistered but sticky entry remains: still treat
+        // as enforced with the bare ENFORCED flag so fail-closed hooks apply.
+        return Some((gov_cgid, CGROUP_FLAG_ENFORCED));
+    }
     None
 }
 
@@ -63,6 +78,22 @@ pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
 #[inline(always)]
 pub fn enforced_cgroup_for_current() -> Option<u64> {
     enforced_cgroup_flags_for_current().map(|(id, _)| id)
+}
+
+/// Resolve the governing enforced cgroup for a known PID (fork inheritance).
+/// Prefers sticky map, then falls back to the *current* task's cgroup walk
+/// (only valid when the current task is that PID — i.e. the parent at fork).
+#[inline(always)]
+pub fn governing_cgroup_for_pid(pid: u32) -> Option<u64> {
+    if let Some(&gov) = unsafe { PROC_ENFORCED.get(&pid) } {
+        return Some(gov);
+    }
+    // Parent is current task at sched_process_fork: reuse full resolver.
+    let cur_pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    if cur_pid == pid {
+        return enforced_cgroup_for_current();
+    }
+    None
 }
 
 // --- Kernel field offsets (CO-RE substitute) ---
@@ -175,6 +206,14 @@ pub static CRED_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 pub static CRED_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 
 // --- Process deny-set maps ---
+
+/// Process-tree sticky enforcement: pid → governing enforced cgroup_id.
+///
+/// Seeded with the container init PID at register; inherited on
+/// `sched_process_fork`. Survives cgroup migrations to sibling/non-ancestor
+/// cgroups so enforcement subject stays closed under "things Linux will run."
+#[map]
+pub static PROC_ENFORCED: HashMap<u32, u64> = HashMap::with_max_entries(16384, 0);
 
 /// Per-process deny-set membership (pid → deny_set_id).
 #[map]

@@ -51,7 +51,7 @@ async fn test_register_own_cgroup() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    let handle = mgr.register("test-ctr-1", &cgroup).await.unwrap();
+    let handle = mgr.register("test-ctr-1", &cgroup, 0).await.unwrap();
     assert_eq!(handle.container_id, "test-ctr-1");
     assert!(handle.cgroup_id > 0, "cgroup_id should be non-zero");
 
@@ -64,7 +64,7 @@ async fn test_register_unregister_roundtrip() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    let handle = mgr.register("test-ctr-rt", &cgroup).await.unwrap();
+    let handle = mgr.register("test-ctr-rt", &cgroup, 0).await.unwrap();
     assert!(handle.cgroup_id > 0);
 
     mgr.unregister("test-ctr-rt").await.unwrap();
@@ -90,7 +90,7 @@ async fn test_network_apply_allowed_host() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-host", &cgroup).await.unwrap();
+    mgr.register("test-net-host", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec!["127.0.0.1".into()],
@@ -111,7 +111,7 @@ async fn test_network_apply_egress_rule() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-egress", &cgroup).await.unwrap();
+    mgr.register("test-net-egress", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec![],
@@ -134,7 +134,7 @@ async fn test_network_apply_empty_policy() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-empty", &cgroup).await.unwrap();
+    mgr.register("test-net-empty", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec![],
@@ -153,7 +153,7 @@ async fn test_network_apply_multiple_hosts() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-multi", &cgroup).await.unwrap();
+    mgr.register("test-net-multi", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec!["127.0.0.1".into(), "10.0.0.1".into()],
@@ -172,7 +172,7 @@ async fn test_network_apply_unresolvable_host() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-unres", &cgroup).await.unwrap();
+    mgr.register("test-net-unres", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec!["this.host.definitely.does.not.exist.invalid".into()],
@@ -196,7 +196,7 @@ async fn test_filesystem_apply_read_path() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-fs-read", &cgroup).await.unwrap();
+    mgr.register("test-fs-read", &cgroup, 0).await.unwrap();
 
     let policy = FilesystemPolicy {
         read_paths: vec!["/tmp".into()],
@@ -215,7 +215,7 @@ async fn test_filesystem_apply_write_path() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-fs-write", &cgroup).await.unwrap();
+    mgr.register("test-fs-write", &cgroup, 0).await.unwrap();
 
     let policy = FilesystemPolicy {
         read_paths: vec![],
@@ -236,7 +236,7 @@ async fn test_filesystem_apply_empty_policy() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-fs-empty", &cgroup).await.unwrap();
+    mgr.register("test-fs-empty", &cgroup, 0).await.unwrap();
 
     let policy = FilesystemPolicy {
         read_paths: vec![],
@@ -261,7 +261,7 @@ async fn test_process_apply_allowed_binary() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-proc-bin", &cgroup).await.unwrap();
+    mgr.register("test-proc-bin", &cgroup, 0).await.unwrap();
 
     // /bin/true or /usr/bin/true — must exist on any Linux system.
     let binary = if std::path::Path::new("/bin/true").exists() {
@@ -289,7 +289,7 @@ async fn test_process_apply_multiple_binaries() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-proc-multi", &cgroup).await.unwrap();
+    mgr.register("test-proc-multi", &cgroup, 0).await.unwrap();
 
     // Collect binaries that actually exist on this system.
     let candidates = ["/bin/sh", "/bin/ls", "/bin/cat", "/usr/bin/env"];
@@ -319,7 +319,7 @@ async fn test_process_apply_nonexistent_binary() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-proc-noent", &cgroup).await.unwrap();
+    mgr.register("test-proc-noent", &cgroup, 0).await.unwrap();
 
     let policy = ProcessPolicy {
         allowed_binaries: vec!["/nonexistent/binary/path/should/not/exist".into()],
@@ -341,7 +341,7 @@ async fn test_credential_apply_secret_acl() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-cred-acl", &cgroup).await.unwrap();
+    mgr.register("test-cred-acl", &cgroup, 0).await.unwrap();
 
     // Create a temporary file to use as a secret path.
     let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
@@ -368,7 +368,7 @@ async fn test_credential_apply_ttl() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-cred-ttl", &cgroup).await.unwrap();
+    mgr.register("test-cred-ttl", &cgroup, 0).await.unwrap();
 
     let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
     let path = tmp.path().to_str().unwrap().to_string();
@@ -399,7 +399,7 @@ async fn test_get_stats_returns_defaults() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-stats", &cgroup).await.unwrap();
+    mgr.register("test-stats", &cgroup, 0).await.unwrap();
 
     let stats = mgr.get_stats("test-stats").await.unwrap();
     assert_eq!(stats.network_allowed, 0);
@@ -418,7 +418,7 @@ async fn test_subscribe_events_returns_receiver() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-events", &cgroup).await.unwrap();
+    mgr.register("test-events", &cgroup, 0).await.unwrap();
 
     let _rx = mgr.subscribe_events("test-events").await.unwrap();
     // Receiver is valid. No events expected without actual BPF hook triggers.
@@ -436,7 +436,7 @@ async fn test_get_stats_includes_credential_fields() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-cred-stats", &cgroup).await.unwrap();
+    mgr.register("test-cred-stats", &cgroup, 0).await.unwrap();
 
     let stats = mgr.get_stats("test-cred-stats").await.unwrap();
 
@@ -484,7 +484,7 @@ async fn test_secret_acl_enforcement() {
 
     // 1. Register the current process cgroup for enforcement.
     let handle = mgr
-        .register("test-secret-acl", &cgroup)
+        .register("test-secret-acl", &cgroup, 0)
         .await
         .expect("register should succeed");
     assert!(handle.cgroup_id > 0);

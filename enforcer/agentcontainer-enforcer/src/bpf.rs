@@ -691,11 +691,12 @@ mod linux {
             &self,
             container_id: &str,
             cgroup_path: &str,
+            init_pid: u32,
         ) -> anyhow::Result<ContainerHandle> {
             let cgroup_id = Self::resolve_cgroup_id(cgroup_path)?;
             info!(
                 container_id,
-                cgroup_id, cgroup_path, "registering cgroup for BPF enforcement"
+                cgroup_id, cgroup_path, init_pid, "registering cgroup for BPF enforcement"
             );
 
             // Insert into ENFORCED_CGROUPS BPF map.
@@ -706,6 +707,20 @@ mod linux {
                         .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?,
                 )?;
                 map.insert(cgroup_id, CGROUP_FLAG_ENFORCED, 0)?;
+
+                // Seed process-tree sticky map so forks inherit the subject even
+                // when they land in sibling/non-ancestor cgroups (cron, systemd).
+                if init_pid != 0 {
+                    let mut sticky: AyaHashMap<_, u32, u64> = AyaHashMap::try_from(
+                        bpf.map_mut("PROC_ENFORCED")
+                            .ok_or_else(|| anyhow::anyhow!("BPF map PROC_ENFORCED not found"))?,
+                    )?;
+                    sticky.insert(init_pid, cgroup_id, 0)?;
+                    info!(
+                        init_pid,
+                        cgroup_id, "seeded PROC_ENFORCED for container init"
+                    );
+                }
             }
 
             // Track in registry for event correlation.
@@ -1341,6 +1356,7 @@ mod stub {
             &self,
             container_id: &str,
             cgroup_path: &str,
+            init_pid: u32,
         ) -> anyhow::Result<ContainerHandle> {
             let cgroup_id = {
                 let mut id = self.next_fake_id.write().unwrap();
@@ -1350,7 +1366,10 @@ mod stub {
             };
             warn!(
                 container_id,
-                cgroup_path, cgroup_id, "stub: register is a no-op (no BPF on this platform)"
+                cgroup_path,
+                cgroup_id,
+                init_pid,
+                "stub: register is a no-op (no BPF on this platform)"
             );
 
             self.registry
@@ -1523,12 +1542,18 @@ mod tests {
     async fn test_stub_register_unregister() {
         let mgr = BpfPolicyManager::new().unwrap();
 
-        let handle = mgr.register("ctr-1", "/sys/fs/cgroup/test").await.unwrap();
+        let handle = mgr
+            .register("ctr-1", "/sys/fs/cgroup/test", 0)
+            .await
+            .unwrap();
         assert_eq!(handle.container_id, "ctr-1");
         assert!(handle.cgroup_id > 0);
 
         // Second register gets a different cgroup ID.
-        let handle2 = mgr.register("ctr-2", "/sys/fs/cgroup/test2").await.unwrap();
+        let handle2 = mgr
+            .register("ctr-2", "/sys/fs/cgroup/test2", 0)
+            .await
+            .unwrap();
         assert_ne!(handle.cgroup_id, handle2.cgroup_id);
 
         // Unregister should succeed.
@@ -1542,7 +1567,9 @@ mod tests {
     #[tokio::test]
     async fn test_stub_apply_policies() {
         let mgr = BpfPolicyManager::new().unwrap();
-        mgr.register("ctr-1", "/sys/fs/cgroup/test").await.unwrap();
+        mgr.register("ctr-1", "/sys/fs/cgroup/test", 0)
+            .await
+            .unwrap();
 
         // All apply methods should succeed as no-ops.
         mgr.apply_network(
