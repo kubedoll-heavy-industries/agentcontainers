@@ -22,7 +22,7 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
       image: ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: docker/setup-qemu-action@v4
 

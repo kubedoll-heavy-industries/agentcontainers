@@ -58,7 +58,7 @@ jobs:
     timeout-minutes: 30
     if: github.actor != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
