@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 )
 
@@ -47,6 +48,29 @@ type ociManifest struct {
 	Layers    []ociDescriptor `json:"layers"`
 }
 
+// platformIndex is an OCI image index with platform information for resolving
+// multi-arch manifest lists. Separate from ociIndex in referrers.go which
+// uses the Referrer type (no platform field).
+type platformIndex struct {
+	MediaType string               `json:"mediaType,omitempty"`
+	Manifests []platformDescriptor `json:"manifests"`
+}
+
+// platformDescriptor is a single entry in a platform index.
+type platformDescriptor struct {
+	MediaType string       `json:"mediaType"`
+	Digest    string       `json:"digest"`
+	Size      int64        `json:"size"`
+	Platform  *ociPlatform `json:"platform,omitempty"`
+}
+
+// ociPlatform describes the platform for an index entry.
+type ociPlatform struct {
+	Architecture string `json:"architecture"`
+	OS           string `json:"os"`
+	Variant      string `json:"variant,omitempty"`
+}
+
 // ociDescriptor describes a content-addressable blob.
 // The Annotations field carries optional key/value metadata per the OCI Image
 // Layout Specification §descriptor. We use it to hold AnnotationOrgPolicySigner
@@ -60,6 +84,10 @@ type ociDescriptor struct {
 
 // PolicyArtifactMediaType is the expected media type for org policy layers.
 const PolicyArtifactMediaType = "application/vnd.agentcontainers.orgpolicy.v1+json"
+
+// PolicyBundleArtifactMediaType is the expected media type for mutable policy
+// bundle layers.
+const PolicyBundleArtifactMediaType = "application/vnd.agentcontainers.policy.v1+json"
 
 // maxPolicySize is the maximum allowed policy artifact size (1 MiB).
 const maxPolicySize = 1 << 20
@@ -93,8 +121,118 @@ func (r *Resolver) FetchPolicy(ctx context.Context, imageRef string) ([]byte, er
 	return data, nil
 }
 
+// FetchPolicyBundle fetches a mutable policy bundle artifact and returns the
+// raw bytes of the first policy bundle layer plus the resolved manifest digest.
+func (r *Resolver) FetchPolicyBundle(ctx context.Context, policyRef string) (data []byte, manifestDigest string, err error) {
+	ref, err := ParseReference(policyRef)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle: %w", err)
+	}
+
+	manifestDigest = ref.Digest
+	if manifestDigest == "" {
+		manifestDigest, err = r.resolveTag(ctx, ref)
+		if err != nil {
+			return nil, "", fmt.Errorf("fetch policy bundle: %w", err)
+		}
+	}
+
+	digestRef := ref
+	digestRef.Tag = ""
+	digestRef.Digest = manifestDigest
+
+	manifest, err := r.fetchManifestVerified(ctx, digestRef)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle: %w", err)
+	}
+
+	layer, err := findPolicyBundleLayer(manifest)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle %s: %w", digestRef.String(), err)
+	}
+
+	data, err = r.fetchBlob(ctx, digestRef, layer.Digest)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch policy bundle %s: %w", digestRef.String(), err)
+	}
+
+	return data, manifestDigest, nil
+}
+
+// manifestAcceptHeader includes all manifest types we handle: single manifests
+// and manifest lists (image indexes). The registry returns whichever matches.
+var manifestAcceptTypes = strings.Join([]string{
+	"application/vnd.oci.image.manifest.v1+json",
+	"application/vnd.docker.distribution.manifest.v2+json",
+	"application/vnd.oci.image.index.v1+json",
+	"application/vnd.docker.distribution.manifest.list.v2+json",
+}, ", ")
+
 // fetchManifest fetches and parses the OCI manifest for a given reference.
+// If the reference resolves to a manifest list (image index), the list is
+// resolved to the platform-specific manifest for the current GOOS/GOARCH.
 func (r *Resolver) fetchManifest(ctx context.Context, ref Reference) (*ociManifest, error) {
+	body, contentType, _, err := r.fetchManifestRaw(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if the response is a manifest list / image index.
+	if isIndexMediaType(contentType) {
+		return r.resolveIndex(ctx, ref, body)
+	}
+
+	var m ociManifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decoding manifest for %s: %w", ref.String(), err)
+	}
+
+	// The response might be an index even if Content-Type doesn't say so.
+	// Check the parsed mediaType field as a fallback.
+	if isIndexMediaType(m.MediaType) {
+		return r.resolveIndex(ctx, ref, body)
+	}
+
+	return &m, nil
+}
+
+// fetchManifestVerified fetches and parses a manifest by digest, verifying the
+// raw manifest body against the digest reference before it is trusted.
+func (r *Resolver) fetchManifestVerified(ctx context.Context, ref Reference) (*ociManifest, error) {
+	if ref.Digest == "" {
+		return nil, fmt.Errorf("verified manifest fetch requires digest reference for %s", ref.String())
+	}
+
+	body, contentType, contentDigest, err := r.fetchManifestRaw(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyManifestDigest(body, ref.Digest, contentDigest); err != nil {
+		return nil, fmt.Errorf("manifest integrity check failed for %s: %w", ref.String(), err)
+	}
+
+	// Check if the response is a manifest list / image index.
+	if isIndexMediaType(contentType) {
+		return r.resolveIndex(ctx, ref, body)
+	}
+
+	var m ociManifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decoding manifest for %s: %w", ref.String(), err)
+	}
+
+	// The response might be an index even if Content-Type doesn't say so.
+	// Check the parsed mediaType field as a fallback.
+	if isIndexMediaType(m.MediaType) {
+		return r.resolveIndex(ctx, ref, body)
+	}
+
+	return &m, nil
+}
+
+// fetchManifestRaw fetches the raw manifest bytes, content type, and registry
+// content digest for a reference.
+func (r *Resolver) fetchManifestRaw(ctx context.Context, ref Reference) ([]byte, string, string, error) {
 	scheme := "https"
 	tagOrDigest := ref.Tag
 	if ref.Digest != "" {
@@ -105,35 +243,103 @@ func (r *Resolver) fetchManifest(ctx context.Context, ref Reference) (*ociManife
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating manifest request: %w", err)
+		return nil, "", "", fmt.Errorf("creating manifest request: %w", err)
 	}
 
-	req.Header.Set("Accept", strings.Join([]string{
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.docker.distribution.manifest.v2+json",
-	}, ", "))
+	req.Header.Set("Accept", manifestAcceptTypes)
 
 	resp, err := r.doWithAuth(ctx, req, ref)
 	if err != nil {
-		return nil, fmt.Errorf("fetching manifest for %s: %w", ref.String(), err)
+		return nil, "", "", fmt.Errorf("fetching manifest for %s: %w", ref.String(), err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("manifest not found for %s", ref.String())
+		return nil, "", "", fmt.Errorf("manifest not found for %s", ref.String())
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("unexpected status %d fetching manifest for %s: %s",
-			resp.StatusCode, ref.String(), string(body))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, "", "", fmt.Errorf("unexpected status %d fetching manifest for %s: %s",
+			resp.StatusCode, ref.String(), string(respBody))
 	}
 
-	var m ociManifest
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPolicySize)).Decode(&m); err != nil {
-		return nil, fmt.Errorf("decoding manifest for %s: %w", ref.String(), err)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicySize))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("reading manifest for %s: %w", ref.String(), err)
 	}
 
-	return &m, nil
+	return data, resp.Header.Get("Content-Type"), resp.Header.Get("Docker-Content-Digest"), nil
+}
+
+// isIndexMediaType returns true if the media type indicates a manifest list.
+func isIndexMediaType(mediaType string) bool {
+	return mediaType == "application/vnd.oci.image.index.v1+json" ||
+		mediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
+}
+
+// resolveIndex parses an OCI image index and resolves it to the platform-specific
+// manifest for the current GOOS/GOARCH.
+func (r *Resolver) resolveIndex(ctx context.Context, ref Reference, data []byte) (*ociManifest, error) {
+	var idx platformIndex
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return nil, fmt.Errorf("decoding image index for %s: %w", ref.String(), err)
+	}
+
+	if len(idx.Manifests) == 0 {
+		return nil, fmt.Errorf("empty image index for %s", ref.String())
+	}
+
+	// Find the manifest matching our platform.
+	targetOS := runtime.GOOS
+	targetArch := runtime.GOARCH
+
+	for _, m := range idx.Manifests {
+		if m.Platform == nil {
+			continue
+		}
+		if m.Platform.OS == targetOS && m.Platform.Architecture == targetArch {
+			// Fetch the platform-specific manifest by digest.
+			digestRef := ref
+			digestRef.Tag = ""
+			digestRef.Digest = m.Digest
+			body, _, _, err := r.fetchManifestRaw(ctx, digestRef)
+			if err != nil {
+				return nil, fmt.Errorf("fetching platform manifest for %s: %w", ref.String(), err)
+			}
+			var manifest ociManifest
+			if err := json.Unmarshal(body, &manifest); err != nil {
+				return nil, fmt.Errorf("decoding platform manifest for %s: %w", ref.String(), err)
+			}
+			return &manifest, nil
+		}
+	}
+
+	// No exact match — fall back to first manifest (best effort).
+	first := idx.Manifests[0]
+	digestRef := ref
+	digestRef.Tag = ""
+	digestRef.Digest = first.Digest
+	body, _, _, err := r.fetchManifestRaw(ctx, digestRef)
+	if err != nil {
+		return nil, fmt.Errorf("fetching fallback manifest for %s: %w", ref.String(), err)
+	}
+	var manifest ociManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return nil, fmt.Errorf("decoding fallback manifest for %s: %w", ref.String(), err)
+	}
+	return &manifest, nil
+}
+
+func findPolicyBundleLayer(m *ociManifest) (ociDescriptor, error) {
+	if len(m.Layers) == 0 {
+		return ociDescriptor{}, fmt.Errorf("no policy bundle layer found in manifest: manifest has no layers")
+	}
+	for _, layer := range m.Layers {
+		if layer.MediaType == PolicyBundleArtifactMediaType {
+			return layer, nil
+		}
+	}
+	return ociDescriptor{}, fmt.Errorf("no policy bundle layer found in manifest")
 }
 
 // findPolicyLayer finds the effective policy layer in the manifest.
@@ -278,7 +484,20 @@ func verifyDigest(data []byte, expected string) error {
 	h := sha256.Sum256(data)
 	got := hex.EncodeToString(h[:])
 	if got != want {
-		return fmt.Errorf("digest mismatch: manifest says %q but blob hashes to sha256:%s", expected, got)
+		return fmt.Errorf("digest mismatch: expected %q but content hashes to sha256:%s", expected, got)
+	}
+	return nil
+}
+
+// verifyManifestDigest binds fetched raw manifest bytes to the digest used to
+// fetch them. If the registry also returned Docker-Content-Digest on the GET,
+// require it to agree with the expected digest before hashing the body.
+func verifyManifestDigest(data []byte, expected, contentDigest string) error {
+	if contentDigest != "" && contentDigest != expected {
+		return fmt.Errorf("Docker-Content-Digest mismatch: expected %q but registry returned %q", expected, contentDigest)
+	}
+	if err := verifyDigest(data, expected); err != nil {
+		return fmt.Errorf("manifest digest mismatch: %w", err)
 	}
 	return nil
 }

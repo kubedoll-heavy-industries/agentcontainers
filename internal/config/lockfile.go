@@ -29,6 +29,7 @@ type ResolvedArtifacts struct {
 	Features map[string]ResolvedFeature `json:"features,omitempty"`
 	MCP      map[string]ResolvedMCP     `json:"mcp,omitempty"`
 	Skills   map[string]ResolvedSkill   `json:"skills,omitempty"`
+	Policy   *ResolvedPolicy            `json:"policy,omitempty"`
 }
 
 // ResolvedImage pins the base container image by digest.
@@ -57,6 +58,16 @@ type ResolvedSkill struct {
 	Digest     string       `json:"digest"`
 	ResolvedAt time.Time    `json:"resolvedAt"`
 	SkillBOM   *SkillBOMRef `json:"skillbom,omitempty"`
+}
+
+// ResolvedPolicy pins the mutable org policy channel to a signed bundle digest.
+type ResolvedPolicy struct {
+	Ref        string        `json:"ref"`
+	Digest     string        `json:"digest"`
+	Epoch      int           `json:"epoch"`
+	ExpiresAt  time.Time     `json:"expiresAt"`
+	ResolvedAt time.Time     `json:"resolvedAt"`
+	Signature  *SignatureRef `json:"signature,omitempty"`
 }
 
 // SignatureRef records Sigstore verification data for an artifact.
@@ -151,6 +162,34 @@ func (l *Lockfile) Validate() error {
 				errs = append(errs, fmt.Errorf("%s.skillbom.embeddingHash must not be empty", prefix))
 			}
 		}
+	}
+
+	if l.Resolved.Policy != nil {
+		if err := validatePolicy(l.Resolved.Policy); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validatePolicy(policy *ResolvedPolicy) error {
+	var errs []error
+
+	if policy.Ref == "" {
+		errs = append(errs, errors.New("resolved.policy.ref must not be empty"))
+	}
+	if err := validateDigest("resolved.policy.digest", policy.Digest); err != nil {
+		errs = append(errs, err)
+	}
+	if policy.Epoch <= 0 {
+		errs = append(errs, fmt.Errorf("resolved.policy.epoch must be greater than 0, got %d", policy.Epoch))
+	}
+	if policy.ExpiresAt.IsZero() {
+		errs = append(errs, errors.New("resolved.policy.expiresAt must not be zero"))
+	}
+	if policy.ResolvedAt.IsZero() {
+		errs = append(errs, errors.New("resolved.policy.resolvedAt must not be zero"))
 	}
 
 	return errors.Join(errs...)

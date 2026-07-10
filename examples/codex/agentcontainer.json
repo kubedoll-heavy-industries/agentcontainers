@@ -1,0 +1,28 @@
+{
+  // OpenAI Codex CLI agent running in an agentcontainer.
+  // Requires an OpenAI API key — set OPENAI_API_KEY in your environment.
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "agent": {
+    "capabilities": {
+      "network": {
+        "egress": [
+          { "host": "api.openai.com", "port": 443 }
+        ]
+      },
+      "shell": {
+        "commands": ["codex", "node", "npm", "git"]
+      },
+      "filesystem": {
+        "read": ["/workspace"],
+        "write": ["/workspace"]
+      }
+    },
+    "secrets": {
+      "OPENAI_API_KEY": {
+        "provider": "env://OPENAI_API_KEY"
+      }
+    }
+  }
+}

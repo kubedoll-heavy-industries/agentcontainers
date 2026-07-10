@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "hopper": {
-      "command": "/bin/bash",
-      "args": ["-c", "/Applications/Hopper\\ Disassembler.app/Contents/MacOS/HopperMCPServer"]
-    }
-  }
-}

@@ -18,9 +18,81 @@ use tracing::warn;
 
 use crate::events::{ContainerRegistry, EventBus};
 use crate::policy::{
-    ContainerHandle, CredentialPolicy, EnforcementEvent, EnforcementStats, FilesystemPolicy,
-    NetworkPolicy, PolicyManager, ProcessPolicy,
+    BindPolicy, ContainerHandle, CredentialPolicy, DenySetPolicy, EnforcementEvent,
+    EnforcementStats, FilesystemPolicy, NetworkPolicy, PolicyManager, ProcessPolicy,
+    ResolvedDenySetEntry, ReverseShellConfig,
 };
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use std::path::{Path, PathBuf};
+
+/// Minimal common prefix for all event records written to ring buffers.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EventPidHeader {
+    timestamp_ns: u64,
+    pid: u32,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn read_event_pid(data: &[u8]) -> Option<u32> {
+    if data.len() < std::mem::size_of::<EventPidHeader>() {
+        return None;
+    }
+
+    let header: EventPidHeader = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const _) };
+    Some(header.pid)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn parse_proc_cgroup_relative_path(contents: &str) -> Option<&str> {
+    let mut fallback = None;
+
+    for line in contents.lines() {
+        let (hierarchy, rest) = line.split_once(':')?;
+        let (_, path) = rest.split_once(':')?;
+        if path.is_empty() {
+            continue;
+        }
+        if hierarchy == "0" {
+            return Some(path);
+        }
+        fallback.get_or_insert(path);
+    }
+
+    fallback
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn resolve_cgroup_path_for_pid_with_roots(
+    pid: u32,
+    proc_root: &Path,
+    cgroup_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    let cgroup_file = proc_root.join(pid.to_string()).join("cgroup");
+    let contents = std::fs::read_to_string(&cgroup_file)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", cgroup_file.display()))?;
+    let relative = parse_proc_cgroup_relative_path(&contents)
+        .ok_or_else(|| anyhow::anyhow!("no cgroup path found in {}", cgroup_file.display()))?;
+    let relative = relative.strip_prefix('/').unwrap_or(relative);
+    Ok(cgroup_root.join(relative))
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn resolve_cgroup_id_for_pid_with_roots(
+    pid: u32,
+    proc_root: &Path,
+    cgroup_root: &Path,
+) -> anyhow::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let cgroup_path = resolve_cgroup_path_for_pid_with_roots(pid, proc_root, cgroup_root)?;
+    let meta = std::fs::metadata(&cgroup_path).map_err(|e| {
+        anyhow::anyhow!("failed to stat cgroup path {}: {e}", cgroup_path.display())
+    })?;
+    Ok(meta.ino())
+}
 
 // ===========================================================================
 // Linux implementation — real BPF via aya
@@ -29,16 +101,23 @@ use crate::policy::{
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::events::{parse_cred_event, parse_exec_event, parse_fs_event, parse_network_event};
+    use crate::events::{
+        parse_bind_event, parse_cred_event, parse_dns_event, parse_exec_event, parse_fs_event,
+        parse_memfd_event, parse_network_event, parse_reverse_shell_event, MemfdEvent,
+    };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        CgroupStats, FsInodeKey, PortKeyV4, SecretAclKey, SecretAclValue, FS_PERM_READ,
-        FS_PERM_WRITE,
+        CgroupStats, DenySetKey, KernelOffsets, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4,
+        ScopedPortKeyV4, SecretAclKey, SecretAclValue, CGROUP_FLAG_ENFORCED,
+        CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ, FS_PERM_WRITE,
     };
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
     use aya::Ebpf;
     use std::os::unix::fs::MetadataExt;
+
+    const CGROUP_PREFIX_BITS: u32 = 64;
+    const IPV4_PREFIX_BITS: u32 = CGROUP_PREFIX_BITS + 32;
 
     /// Well-known paths where the BPF ELF may be found, in priority order.
     ///
@@ -111,6 +190,10 @@ mod linux {
 
             info!("BPF programs loaded successfully");
 
+            // Attach programs to their kernel hook points.
+            Self::populate_kernel_offsets(&mut bpf)?;
+            Self::attach_programs(&mut bpf)?;
+
             let registry = ContainerRegistry::new();
             let event_bus = EventBus::new();
 
@@ -125,6 +208,187 @@ mod linux {
             mgr.spawn_event_readers();
 
             Ok(mgr)
+        }
+
+        /// Attach all BPF programs to their kernel hook points.
+        ///
+        /// Programs are attached in a best-effort manner: if a specific hook is
+        /// unavailable on the running kernel (e.g., `sys_enter_memfd_create` on
+        /// older kernels), a warning is logged but startup continues. Only
+        /// critical failures (e.g., unable to open the root cgroup) are fatal.
+        fn attach_programs(bpf: &mut Ebpf) -> anyhow::Result<()> {
+            use aya::programs::{CgroupAttachMode, CgroupSockAddr, KProbe, Lsm, TracePoint};
+            use aya::Btf;
+            use std::os::fd::AsFd;
+
+            // Open the root cgroup v2 hierarchy for cgroup-attached programs.
+            let cgroup_file = std::fs::File::open("/sys/fs/cgroup/")
+                .map_err(|e| anyhow::anyhow!("failed to open cgroup v2 root: {e}"))?;
+            let cgroup_fd = cgroup_file.as_fd();
+
+            let btf = Btf::from_sys_fs()
+                .map_err(|e| anyhow::anyhow!("failed to load kernel BTF for LSM hooks: {e}"))?;
+
+            // ---------------------------------------------------------------
+            // LSM hooks (required for process enforcement)
+            // ---------------------------------------------------------------
+
+            match bpf.program_mut("ac_bprm_check") {
+                Some(prog) => {
+                    let lsm: &mut Lsm = prog.try_into()?;
+                    lsm.load("bprm_check_security", &btf)?;
+                    lsm.attach()
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bprm_check: {e}"))?;
+                    info!("attached ac_bprm_check to LSM bprm_check_security");
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "BPF program ac_bprm_check not found in ELF"
+                    ));
+                }
+            }
+
+            match bpf.program_mut("ac_file_open") {
+                Some(prog) => {
+                    let lsm: &mut Lsm = prog.try_into()?;
+                    lsm.load("file_open", &btf)?;
+                    lsm.attach()
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_file_open: {e}"))?;
+                    info!("attached ac_file_open to LSM file_open");
+                }
+                None => {
+                    return Err(anyhow::anyhow!("BPF program ac_file_open not found in ELF"));
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Tracepoints
+            // ---------------------------------------------------------------
+
+            // sched/sched_process_fork — deny-set inheritance tracking.
+            match bpf.program_mut("ac_sched_fork") {
+                Some(prog) => {
+                    let tp: &mut TracePoint = prog.try_into()?;
+                    tp.load()?;
+                    match tp.attach("sched", "sched_process_fork") {
+                        Ok(_link) => info!("attached ac_sched_fork to sched/sched_process_fork"),
+                        Err(e) => warn!(error = %e, "failed to attach ac_sched_fork (non-fatal)"),
+                    }
+                }
+                None => warn!("BPF program ac_sched_fork not found in ELF"),
+            }
+
+            // sched/sched_process_exit — deny-set cleanup on process exit.
+            match bpf.program_mut("ac_sched_exit") {
+                Some(prog) => {
+                    let tp: &mut TracePoint = prog.try_into()?;
+                    tp.load()?;
+                    match tp.attach("sched", "sched_process_exit") {
+                        Ok(_link) => info!("attached ac_sched_exit to sched/sched_process_exit"),
+                        Err(e) => warn!(error = %e, "failed to attach ac_sched_exit (non-fatal)"),
+                    }
+                }
+                None => warn!("BPF program ac_sched_exit not found in ELF"),
+            }
+
+            // syscalls/sys_enter_memfd_create — fileless execution detection.
+            match bpf.program_mut("ac_memfd_create") {
+                Some(prog) => {
+                    let tp: &mut TracePoint = prog.try_into()?;
+                    tp.load()?;
+                    match tp.attach("syscalls", "sys_enter_memfd_create") {
+                        Ok(_link) => {
+                            info!("attached ac_memfd_create to syscalls/sys_enter_memfd_create")
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            "failed to attach ac_memfd_create — kernel may lack this tracepoint (non-fatal)"
+                        ),
+                    }
+                }
+                None => warn!("BPF program ac_memfd_create not found in ELF"),
+            }
+
+            // ---------------------------------------------------------------
+            // Cgroup socket address hooks (bind enforcement)
+            // ---------------------------------------------------------------
+
+            for program_name in ["ac_connect4", "ac_connect6", "ac_sendmsg4", "ac_sendmsg6"] {
+                match bpf.program_mut(program_name) {
+                    Some(prog) => {
+                        let cg: &mut CgroupSockAddr = prog.try_into()?;
+                        cg.load()?;
+                        cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                            .map_err(|e| anyhow::anyhow!("failed to attach {program_name}: {e}"))?;
+                        info!(
+                            program = program_name,
+                            "attached cgroup socket address program"
+                        );
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "BPF program {program_name} not found in ELF"
+                        ));
+                    }
+                }
+            }
+
+            // cgroup/bind4 — IPv4 bind enforcement.
+            match bpf.program_mut("ac_bind4") {
+                Some(prog) => {
+                    let cg: &mut CgroupSockAddr = prog.try_into()?;
+                    cg.load()?;
+                    cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bind4: {e}"))?;
+                    info!("attached ac_bind4 to cgroup bind4");
+                }
+                None => return Err(anyhow::anyhow!("BPF program ac_bind4 not found in ELF")),
+            }
+
+            // cgroup/bind6 — IPv6 bind enforcement.
+            match bpf.program_mut("ac_bind6") {
+                Some(prog) => {
+                    let cg: &mut CgroupSockAddr = prog.try_into()?;
+                    cg.load()?;
+                    cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bind6: {e}"))?;
+                    info!("attached ac_bind6 to cgroup bind6");
+                }
+                None => return Err(anyhow::anyhow!("BPF program ac_bind6 not found in ELF")),
+            }
+
+            // ---------------------------------------------------------------
+            // Kprobe — reverse shell dup2 detection
+            // ---------------------------------------------------------------
+
+            // kprobe/__x64_sys_dup2 — detects stdin/stdout redirection to sockets.
+            match bpf.program_mut("ac_dup2_check") {
+                Some(prog) => {
+                    let kp: &mut KProbe = prog.try_into()?;
+                    kp.load()?;
+                    match kp.attach("__x64_sys_dup2", 0) {
+                        Ok(_link) => info!("attached ac_dup2_check to kprobe __x64_sys_dup2"),
+                        Err(e) => warn!(
+                            error = %e,
+                            "failed to attach ac_dup2_check — __x64_sys_dup2 may not exist on this arch (non-fatal)"
+                        ),
+                    }
+                }
+                None => warn!("BPF program ac_dup2_check not found in ELF"),
+            }
+
+            // ---------------------------------------------------------------
+            // LSM hooks — loaded and attached by aya automatically when the
+            // ELF contains BTF-based LSM programs. We log their presence here
+            // for observability but no manual attachment is needed.
+            // ---------------------------------------------------------------
+
+            // Suppress unused variable warning for cgroup_fd — it's used above
+            // and kept alive until this function returns.
+            let _ = &cgroup_file;
+
+            info!("BPF program attachment complete");
+            Ok(())
         }
 
         /// Spawn background tasks that drain all BPF ring buffers and publish
@@ -198,9 +462,17 @@ mod linux {
                         }
 
                         spawn_reader!("NET_EVENTS", bpf_events::NetworkEvent, parse_network_event);
+                        spawn_reader!("DNS_EVENTS", bpf_events::DnsEvent, parse_dns_event);
                         spawn_reader!("FS_EVENTS", bpf_events::FsEvent, parse_fs_event);
                         spawn_reader!("PROC_EVENTS", bpf_events::ExecEvent, parse_exec_event);
                         spawn_reader!("CRED_EVENTS", bpf_events::CredEvent, parse_cred_event);
+                        spawn_reader!("BIND_EVENTS", bpf_events::BindEvent, parse_bind_event);
+                        spawn_reader!(
+                            "REVERSE_SHELL_EVENTS",
+                            bpf_events::ReverseShellEvent,
+                            parse_reverse_shell_event
+                        );
+                        spawn_reader!("MEMFD_EVENTS", MemfdEvent, parse_memfd_event);
 
                         for h in handles {
                             let _ = h.await;
@@ -224,7 +496,7 @@ mod linux {
         async fn run_ring_buf_reader<F>(
             mut ring_buf: RingBuf<&aya::maps::MapData>,
             bus: EventBus,
-            _registry: ContainerRegistry,
+            registry: ContainerRegistry,
             parse: F,
         ) where
             F: Fn(&[u8], &str) -> Option<crate::policy::EnforcementEvent> + Send + 'static,
@@ -260,18 +532,12 @@ mod linux {
                 // Drain all available records.
                 while let Some(item) = ring_buf.next() {
                     let data: &[u8] = &item;
-
-                    // The cgroup_id is embedded at offset 24 in all our event structs
-                    // (after timestamp_ns:u64, pid:u32, uid:u32, event_type:u32, verdict:u32, inode:u64).
-                    // For CRED_EVENTS it is explicit; for other events we use the registry.
-                    // Here we read a u64 cgroup_id from the CredEvent-specific offset if present,
-                    // otherwise fall back to zero (events that don't carry cgroup_id use
-                    // container_id="" meaning "unknown").
-                    //
-                    // For a cleaner implementation each event type should carry cgroup_id.
-                    // CredEvent does; NetworkEvent, FsEvent, ExecEvent do not yet.
-                    // Until those structs are extended, we resolve with "" (broadcast).
-                    let container_id = "".to_string();
+                    let container_id = match read_event_pid(data) {
+                        Some(pid) => Self::resolve_container_id_for_pid(&registry, pid)
+                            .await
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
 
                     if let Some(event) = parse(data, &container_id) {
                         bus.publish(event);
@@ -281,6 +547,25 @@ mod linux {
                 guard.clear_ready();
                 let _ = online_cpus(); // suppress unused import warning
             }
+        }
+
+        async fn resolve_container_id_for_pid(
+            registry: &ContainerRegistry,
+            pid: u32,
+        ) -> Option<String> {
+            let cgroup_id = match resolve_cgroup_id_for_pid_with_roots(
+                pid,
+                Path::new("/proc"),
+                Path::new("/sys/fs/cgroup"),
+            ) {
+                Ok(cgroup_id) => cgroup_id,
+                Err(e) => {
+                    warn!(pid, error = %e, "failed to resolve event pid to cgroup");
+                    return None;
+                }
+            };
+
+            registry.lookup(cgroup_id).await
         }
 
         /// Locate and read the BPF ELF binary.
@@ -320,6 +605,67 @@ mod linux {
             )
         }
 
+        /// Resolve the kernel struct field byte-offsets the LSM hooks need from
+        /// the running kernel's BTF. Portable across kernel versions — the Rust
+        /// eBPF toolchain emits no CO-RE relocations, so the eBPF side reads
+        /// `base + offset` using these instead of hardcoded `#[repr(C)]` mirrors.
+        fn resolve_kernel_offsets() -> anyhow::Result<KernelOffsets> {
+            use btf_rs::Type;
+            let btf = btf_rs::Btf::from_file("/sys/kernel/btf/vmlinux").map_err(|e| {
+                anyhow::anyhow!("loading kernel BTF (/sys/kernel/btf/vmlinux): {e}")
+            })?;
+            let byte_off = |strct: &str, field: &str| -> anyhow::Result<u32> {
+                let types = btf
+                    .resolve_types_by_name(strct)
+                    .map_err(|e| anyhow::anyhow!("BTF lookup for struct {strct}: {e}"))?;
+                for t in types {
+                    let s = match t {
+                        Type::Struct(s) | Type::Union(s) => s,
+                        _ => continue,
+                    };
+                    for m in &s.members {
+                        let name = btf
+                            .resolve_name(m)
+                            .map_err(|e| anyhow::anyhow!("BTF member name in {strct}: {e}"))?;
+                        if name == field {
+                            if m.bitfield_size().unwrap_or(0) != 0 {
+                                anyhow::bail!("{strct}.{field} is a bitfield (unsupported)");
+                            }
+                            return Ok(m.bit_offset() / 8);
+                        }
+                    }
+                }
+                anyhow::bail!("{strct}.{field} not found in kernel BTF")
+            };
+            Ok(KernelOffsets {
+                binprm_file: byte_off("linux_binprm", "file")?,
+                file_f_inode: byte_off("file", "f_inode")?,
+                file_f_path: byte_off("file", "f_path")?,
+                file_f_flags: byte_off("file", "f_flags")?,
+                path_dentry: byte_off("path", "dentry")?,
+                dentry_d_name: byte_off("dentry", "d_name")?,
+                qstr_name: byte_off("qstr", "name")?,
+                inode_i_ino: byte_off("inode", "i_ino")?,
+                inode_i_sb: byte_off("inode", "i_sb")?,
+                sb_s_dev: byte_off("super_block", "s_dev")?,
+                sb_s_magic: byte_off("super_block", "s_magic")?,
+            })
+        }
+
+        /// Populate the single-entry KERNEL_OFFSETS array map from BTF, before
+        /// any program is attached. A failure here is fatal: without correct
+        /// offsets the LSM hooks cannot verify executable/file identity.
+        fn populate_kernel_offsets(bpf: &mut Ebpf) -> anyhow::Result<()> {
+            let offsets = Self::resolve_kernel_offsets()?;
+            let map = bpf
+                .map_mut("KERNEL_OFFSETS")
+                .ok_or_else(|| anyhow::anyhow!("BPF map KERNEL_OFFSETS not found"))?;
+            let mut arr: aya::maps::Array<_, KernelOffsets> = aya::maps::Array::try_from(map)?;
+            arr.set(0, offsets, 0)?;
+            info!(?offsets, "resolved kernel struct offsets from BTF");
+            Ok(())
+        }
+
         /// Resolve a cgroup filesystem path to a cgroup ID (inode number).
         fn resolve_cgroup_id(cgroup_path: &str) -> anyhow::Result<u64> {
             let meta = std::fs::metadata(cgroup_path)
@@ -332,9 +678,9 @@ mod linux {
             let meta = std::fs::metadata(path)
                 .map_err(|e| anyhow::anyhow!("failed to stat {path}: {e}"))?;
             let dev = meta.dev();
-            // major/minor device numbers from the combined dev_t.
-            let dev_major = ((dev >> 8) & 0xfff) as u32;
-            let dev_minor = (dev & 0xff) as u32;
+            // Match Linux's userspace dev_t major/minor decoding.
+            let dev_major = (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32;
+            let dev_minor = ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32;
             Ok((meta.ino(), dev_major, dev_minor))
         }
     }
@@ -359,7 +705,7 @@ mod linux {
                     bpf.map_mut("ENFORCED_CGROUPS")
                         .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?,
                 )?;
-                map.insert(cgroup_id, 1, 0)?;
+                map.insert(cgroup_id, CGROUP_FLAG_ENFORCED, 0)?;
             }
 
             // Track in registry for event correlation.
@@ -408,16 +754,15 @@ mod linux {
                         }
                     }
 
-                    // Clean up per-cgroup entries in ALLOWED_PORTS (keyed by IP+port, not cgroup,
-                    // so we cannot selectively remove — this is acceptable because policy is
-                    // re-applied on register).
+                    // Policy maps are scoped by cgroup where possible; exact
+                    // key cleanup is handled by the follow-up policy index.
 
                     // Clean up SECRET_ACLS entries for this cgroup.
                     // SecretAclKey includes cgroup_id, but we'd need to iterate all keys.
                     // For now, log that cleanup is best-effort.
                     warn!(
                         cgroup_id,
-                        "per-cgroup cleanup for ALLOWED_PORTS/SECRET_ACLS is best-effort; \
+                        "per-cgroup cleanup for scoped policy maps/SECRET_ACLS is best-effort; \
                          stale entries expire naturally or on next policy apply"
                     );
                 } // MutexGuard dropped before await
@@ -445,11 +790,19 @@ mod linux {
                         let mut bpf = self.programs.lock().unwrap();
                         for addr in addrs {
                             if let std::net::IpAddr::V4(ip) = addr.ip() {
-                                let key = LpmKey::new(32, u32::from(ip).to_be());
+                                let key = LpmKey::new(
+                                    IPV4_PREFIX_BITS,
+                                    ScopedLpmKeyV4 {
+                                        cgroup_id,
+                                        addr: u32::from(ip).to_be(),
+                                        _pad: 0,
+                                    },
+                                );
                                 let map_data = bpf.map_mut("ALLOWED_V4").ok_or_else(|| {
                                     anyhow::anyhow!("BPF map ALLOWED_V4 not found")
                                 })?;
-                                let mut map: LpmTrie<_, u32, u8> = LpmTrie::try_from(map_data)?;
+                                let mut map: LpmTrie<_, ScopedLpmKeyV4, u8> =
+                                    LpmTrie::try_from(map_data)?;
                                 map.insert(&key, 1, 0)?;
                                 info!(host, ip = %ip, "added IP to ALLOWED_V4");
                             }
@@ -476,7 +829,8 @@ mod linux {
                         let mut bpf = self.programs.lock().unwrap();
                         for addr in addrs {
                             if let std::net::IpAddr::V4(ip) = addr.ip() {
-                                let key = PortKeyV4 {
+                                let key = ScopedPortKeyV4 {
+                                    cgroup_id,
                                     ip: u32::from(ip).to_be(),
                                     port: rule.port,
                                     protocol: proto,
@@ -485,7 +839,7 @@ mod linux {
                                 let map_data = bpf.map_mut("ALLOWED_PORTS").ok_or_else(|| {
                                     anyhow::anyhow!("BPF map ALLOWED_PORTS not found")
                                 })?;
-                                let mut map: AyaHashMap<_, PortKeyV4, u8> =
+                                let mut map: AyaHashMap<_, ScopedPortKeyV4, u8> =
                                     AyaHashMap::try_from(map_data)?;
                                 map.insert(key, 1, 0)?;
                                 info!(
@@ -528,15 +882,16 @@ mod linux {
             for path in &policy.read_paths {
                 match Self::resolve_inode(path) {
                     Ok((inode, dev_major, dev_minor)) => {
-                        let key = FsInodeKey {
+                        let key = ScopedFsInodeKey {
                             inode,
+                            cgroup_id,
                             dev_major,
                             dev_minor,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
                             .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_INODES not found"))?;
-                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, FS_PERM_READ, 0)?;
                         info!(path, inode, "added read-only inode to ALLOWED_INODES");
@@ -551,21 +906,46 @@ mod linux {
             for path in &policy.write_paths {
                 match Self::resolve_inode(path) {
                     Ok((inode, dev_major, dev_minor)) => {
-                        let key = FsInodeKey {
+                        let key = ScopedFsInodeKey {
                             inode,
+                            cgroup_id,
                             dev_major,
                             dev_minor,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
                             .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_INODES not found"))?;
-                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, FS_PERM_READ | FS_PERM_WRITE, 0)?;
                         info!(path, inode, "added read-write inode to ALLOWED_INODES");
                     }
                     Err(e) => {
                         warn!(path, error = %e, "failed to resolve write path inode, skipping");
+                    }
+                }
+            }
+
+            // Insert denied paths. Deny entries take priority in the BPF hook.
+            for path in &policy.deny_paths {
+                match Self::resolve_inode(path) {
+                    Ok((inode, dev_major, dev_minor)) => {
+                        let key = ScopedFsInodeKey {
+                            inode,
+                            cgroup_id,
+                            dev_major,
+                            dev_minor,
+                        };
+                        let map_data = bpf
+                            .map_mut("DENIED_INODES")
+                            .ok_or_else(|| anyhow::anyhow!("BPF map DENIED_INODES not found"))?;
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
+                            AyaHashMap::try_from(map_data)?;
+                        map.insert(key, 1, 0)?;
+                        info!(path, inode, "added denied inode to DENIED_INODES");
+                    }
+                    Err(e) => {
+                        warn!(path, error = %e, "failed to resolve deny path inode, skipping");
                     }
                 }
             }
@@ -586,15 +966,16 @@ mod linux {
             for binary in &policy.allowed_binaries {
                 match Self::resolve_inode(binary) {
                     Ok((inode, dev_major, dev_minor)) => {
-                        let key = FsInodeKey {
+                        let key = ScopedFsInodeKey {
                             inode,
+                            cgroup_id,
                             dev_major,
                             dev_minor,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_EXECS")
                             .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
-                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, 1, 0)?;
                         info!(binary, inode, "added binary inode to ALLOWED_EXECS");
@@ -603,6 +984,21 @@ mod linux {
                         warn!(binary, error = %e, "failed to resolve binary inode, skipping");
                     }
                 }
+            }
+
+            // Opt-in exec enforcement: set EXEC_ENFORCED only when allowlist non-empty.
+            {
+                let map_data = bpf
+                    .map_mut("ENFORCED_CGROUPS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?;
+                let mut emap: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(map_data)?;
+                let cur = emap.get(&cgroup_id, 0).unwrap_or(CGROUP_FLAG_ENFORCED);
+                let new = if !policy.allowed_binaries.is_empty() {
+                    cur | CGROUP_FLAG_EXEC_ENFORCED
+                } else {
+                    cur & !CGROUP_FLAG_EXEC_ENFORCED
+                };
+                emap.insert(cgroup_id, new, 0)?;
             }
 
             Ok(())
@@ -676,6 +1072,171 @@ mod linux {
                     }
                 }
             }
+
+            Ok(())
+        }
+
+        async fn apply_deny_set(
+            &self,
+            container_id: &str,
+            policy: &DenySetPolicy,
+        ) -> anyhow::Result<()> {
+            let _cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                entries = policy.entries.len(),
+                transitions = policy.transitions.len(),
+                init_pid = policy.init_pid,
+                init_deny_set_id = policy.init_deny_set_id,
+                "applying deny-set policy to BPF maps"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+
+            // Insert allowed entries into DENY_SET_POLICY map.
+            {
+                let map_data = bpf
+                    .map_mut("DENY_SET_POLICY")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map DENY_SET_POLICY not found"))?;
+                let mut map: AyaHashMap<_, DenySetKey, u8> = AyaHashMap::try_from(map_data)?;
+                for entry in &policy.entries {
+                    let key = DenySetKey {
+                        deny_set_id: entry.deny_set_id,
+                        _pad: 0,
+                        inode: entry.inode,
+                        dev_major: entry.dev_major,
+                        dev_minor: entry.dev_minor,
+                    };
+                    map.insert(key, 1u8, 0)?;
+                    info!(
+                        deny_set_id = entry.deny_set_id,
+                        inode = entry.inode,
+                        "added entry to DENY_SET_POLICY"
+                    );
+                }
+            }
+
+            // Insert transitions into DENY_SET_TRANSITIONS map.
+            {
+                let map_data = bpf
+                    .map_mut("DENY_SET_TRANSITIONS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map DENY_SET_TRANSITIONS not found"))?;
+                let mut map: AyaHashMap<_, DenySetKey, u32> = AyaHashMap::try_from(map_data)?;
+                for t in &policy.transitions {
+                    let key = DenySetKey {
+                        deny_set_id: t.parent_deny_set_id,
+                        _pad: 0,
+                        inode: t.child_inode,
+                        dev_major: t.child_dev_major,
+                        dev_minor: t.child_dev_minor,
+                    };
+                    map.insert(key, t.child_deny_set_id, 0)?;
+                    info!(
+                        parent_deny_set_id = t.parent_deny_set_id,
+                        child_deny_set_id = t.child_deny_set_id,
+                        "added transition to DENY_SET_TRANSITIONS"
+                    );
+                }
+            }
+
+            // Insert init PID -> deny_set_id into PROC_DENY_SETS map.
+            {
+                let map_data = bpf
+                    .map_mut("PROC_DENY_SETS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map PROC_DENY_SETS not found"))?;
+                let mut map: AyaHashMap<_, u32, u32> = AyaHashMap::try_from(map_data)?;
+                map.insert(policy.init_pid, policy.init_deny_set_id, 0)?;
+                info!(
+                    init_pid = policy.init_pid,
+                    init_deny_set_id = policy.init_deny_set_id,
+                    "added init PID to PROC_DENY_SETS"
+                );
+            }
+
+            Ok(())
+        }
+
+        async fn update_deny_set(
+            &self,
+            container_id: &str,
+            entry: &ResolvedDenySetEntry,
+        ) -> anyhow::Result<()> {
+            let _cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                deny_set_id = entry.deny_set_id,
+                inode = entry.inode,
+                "updating single deny-set entry in BPF map"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+            let map_data = bpf
+                .map_mut("DENY_SET_POLICY")
+                .ok_or_else(|| anyhow::anyhow!("BPF map DENY_SET_POLICY not found"))?;
+            let mut map: AyaHashMap<_, DenySetKey, u8> = AyaHashMap::try_from(map_data)?;
+            let key = DenySetKey {
+                deny_set_id: entry.deny_set_id,
+                _pad: 0,
+                inode: entry.inode,
+                dev_major: entry.dev_major,
+                dev_minor: entry.dev_minor,
+            };
+            map.insert(key, 1u8, 0)?;
+
+            Ok(())
+        }
+
+        async fn apply_bind(&self, container_id: &str, policy: &BindPolicy) -> anyhow::Result<()> {
+            let cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                cgroup_id,
+                rules = policy.rules.len(),
+                "applying bind policy to BPF maps"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+            let map_data = bpf
+                .map_mut("ALLOWED_BINDS")
+                .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_BINDS not found"))?;
+            let mut map: AyaHashMap<_, ScopedBindKey, u8> = AyaHashMap::try_from(map_data)?;
+
+            for rule in &policy.rules {
+                let key = ScopedBindKey {
+                    cgroup_id,
+                    port: rule.port,
+                    protocol: rule.protocol,
+                    _pad: 0,
+                };
+                map.insert(key, 1u8, 0)?;
+                info!(
+                    port = rule.port,
+                    protocol = rule.protocol,
+                    "added bind rule to ALLOWED_BINDS"
+                );
+            }
+
+            Ok(())
+        }
+
+        async fn configure_reverse_shell(
+            &self,
+            container_id: &str,
+            config: &ReverseShellConfig,
+        ) -> anyhow::Result<()> {
+            let _cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                mode = config.mode,
+                "configuring reverse shell detection in BPF"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+            let map_data = bpf
+                .map_mut("REVERSE_SHELL_MODE")
+                .ok_or_else(|| anyhow::anyhow!("BPF map REVERSE_SHELL_MODE not found"))?;
+            let mut map: aya::maps::Array<_, u8> = aya::maps::Array::try_from(map_data)?;
+            map.set(0, config.mode, 0)?;
 
             Ok(())
         }
@@ -870,6 +1431,55 @@ mod stub {
             Ok(())
         }
 
+        async fn apply_deny_set(
+            &self,
+            container_id: &str,
+            policy: &DenySetPolicy,
+        ) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                entries = policy.entries.len(),
+                transitions = policy.transitions.len(),
+                "stub: apply_deny_set is a no-op"
+            );
+            Ok(())
+        }
+
+        async fn update_deny_set(
+            &self,
+            container_id: &str,
+            entry: &ResolvedDenySetEntry,
+        ) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                deny_set_id = entry.deny_set_id,
+                "stub: update_deny_set is a no-op"
+            );
+            Ok(())
+        }
+
+        async fn apply_bind(&self, container_id: &str, policy: &BindPolicy) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                rules = policy.rules.len(),
+                "stub: apply_bind is a no-op"
+            );
+            Ok(())
+        }
+
+        async fn configure_reverse_shell(
+            &self,
+            container_id: &str,
+            config: &ReverseShellConfig,
+        ) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                mode = config.mode,
+                "stub: configure_reverse_shell is a no-op"
+            );
+            Ok(())
+        }
+
         async fn get_stats(&self, _container_id: &str) -> anyhow::Result<EnforcementStats> {
             Ok(EnforcementStats::default())
         }
@@ -896,7 +1506,17 @@ pub use stub::BpfPolicyManager;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::events::parse_network_event;
     use crate::policy::PolicyManager;
+    #[cfg(unix)]
+    use crate::policy::{EventDomain, EventVerdict};
+    #[cfg(unix)]
+    use agentcontainer_common::events::{EventType, NetworkEvent, Verdict, COMM_MAX};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
+    use tempfile::tempdir;
 
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
@@ -981,5 +1601,88 @@ mod tests {
         let mgr = BpfPolicyManager::new().unwrap();
         let _rx = mgr.subscribe_events("ctr-1").await.unwrap();
         // Receiver is valid; no events will come from stub.
+    }
+
+    #[cfg(unix)]
+    fn sample_network_event(pid: u32) -> NetworkEvent {
+        let mut comm = [0u8; COMM_MAX];
+        comm[..4].copy_from_slice(b"curl");
+
+        NetworkEvent {
+            timestamp_ns: 1_000,
+            pid,
+            uid: 1000,
+            event_type: EventType::NetworkConnect as u32,
+            verdict: Verdict::Block as u32,
+            dst_ip4: 0x0a000001,
+            dst_ip6: [0; 4],
+            dst_port: 443,
+            protocol: 6,
+            ip_version: 4,
+            comm,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pid_resolved_event_reaches_filtered_subscriber() {
+        let tmp = tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("sys/fs/cgroup");
+        let pid = 4242u32;
+
+        let proc_pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&proc_pid_dir).unwrap();
+
+        let cgroup_dir = cgroup_root.join("agentcontainer/test.scope");
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+        std::fs::write(
+            proc_pid_dir.join("cgroup"),
+            "0::/agentcontainer/test.scope\n",
+        )
+        .unwrap();
+
+        let registry = ContainerRegistry::new();
+        let cgroup_id = std::fs::metadata(&cgroup_dir).unwrap().ino();
+        registry.register_container(cgroup_id, "ctr-a".into()).await;
+
+        let raw = sample_network_event(pid);
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                (&raw as *const NetworkEvent).cast::<u8>(),
+                std::mem::size_of::<NetworkEvent>(),
+            )
+        };
+        let resolved_pid = read_event_pid(data).unwrap();
+        let container_id = registry
+            .lookup(
+                resolve_cgroup_id_for_pid_with_roots(resolved_pid, &proc_root, &cgroup_root)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe("ctr-a");
+        bus.publish(parse_network_event(&raw, &container_id));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.container_id, "ctr-a");
+        assert_eq!(event.domain, EventDomain::Network);
+        assert_eq!(event.verdict, EventVerdict::Block);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_proc_cgroup_relative_path_prefers_unified_hierarchy() {
+        let contents = "12:cpuset:/ignored\n0::/agentcontainer/test.scope\n";
+        assert_eq!(
+            parse_proc_cgroup_relative_path(contents),
+            Some("/agentcontainer/test.scope")
+        );
     }
 }

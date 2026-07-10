@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -292,6 +293,16 @@ func TestParseMount_Tmpfs(t *testing.T) {
 
 	assert.Equal(t, mount.TypeTmpfs, m.Type)
 	assert.Equal(t, "/tmp", m.Target)
+}
+
+func TestParseMount_TmpfsOptions(t *testing.T) {
+	m := parseMount("type=tmpfs,target=/home/node,tmpfs-mode=0777")
+	require.NotNil(t, m)
+	require.NotNil(t, m.TmpfsOptions)
+
+	assert.Equal(t, mount.TypeTmpfs, m.Type)
+	assert.Equal(t, os.FileMode(0o777), m.TmpfsOptions.Mode)
+	assert.Empty(t, m.TmpfsOptions.Options)
 }
 
 func TestParseMount_AlternateKeys(t *testing.T) {

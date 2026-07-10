@@ -19,8 +19,41 @@ fn test_port_key_v4_layout() {
 }
 
 #[test]
+fn test_scoped_lpm_key_v4_layout() {
+    assert_eq!(mem::size_of::<ScopedLpmKeyV4>(), 16);
+    assert_eq!(mem::align_of::<ScopedLpmKeyV4>(), 8);
+}
+
+#[test]
+fn test_scoped_lpm_key_v6_layout() {
+    assert_eq!(mem::size_of::<ScopedLpmKeyV6>(), 24);
+    assert_eq!(mem::align_of::<ScopedLpmKeyV6>(), 8);
+}
+
+#[test]
+fn test_scoped_port_key_v4_layout() {
+    assert_eq!(mem::size_of::<ScopedPortKeyV4>(), 16);
+    assert_eq!(mem::align_of::<ScopedPortKeyV4>(), 8);
+}
+
+#[test]
 fn test_fs_inode_key_layout() {
+    // Unscoped: inode(8) + dev_major(4) + dev_minor(4) = 16.
     assert_eq!(mem::size_of::<FsInodeKey>(), 16);
+    // Scoped: inode(8) + cgroup_id(8) + dev_major(4) + dev_minor(4) = 24.
+    assert_eq!(mem::size_of::<ScopedFsInodeKey>(), 24);
+}
+
+#[test]
+fn test_scoped_fs_inode_key_layout() {
+    assert_eq!(mem::size_of::<ScopedFsInodeKey>(), 24);
+    assert_eq!(mem::align_of::<ScopedFsInodeKey>(), 8);
+}
+
+#[test]
+fn test_scoped_bind_key_layout() {
+    assert_eq!(mem::size_of::<ScopedBindKey>(), 16);
+    assert_eq!(mem::align_of::<ScopedBindKey>(), 8);
 }
 
 #[test]

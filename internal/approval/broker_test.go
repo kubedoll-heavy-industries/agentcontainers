@@ -1546,6 +1546,29 @@ func TestBroker_Exec_EscalationDeny_BlocksEverything(t *testing.T) {
 	}
 }
 
+func TestBroker_Exec_EscalationDeny_AllowsBaseline(t *testing.T) {
+	baseline := &config.Capabilities{
+		Shell: &config.ShellCaps{
+			Commands: []config.ShellCommand{{Binary: "cat"}},
+		},
+	}
+	mgr := NewManager(&mockApprover{response: Deny}, "/dev/null", baseline, WithEscalation("deny"))
+	mock := &mockRuntime{execResult: &container.ExecResult{ExitCode: 0, Stdout: []byte("ok\n")}}
+	broker := NewBroker(mock, mgr)
+	session := &container.Session{ContainerID: "test-id"}
+
+	result, err := broker.Exec(context.Background(), session, []string{"cat", "/workspace/file"})
+	if err != nil {
+		t.Fatalf("baseline command should be allowed with escalation=deny: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("exit code = %d, want 0", result.ExitCode)
+	}
+	if len(mock.execCalls) != 1 {
+		t.Errorf("expected 1 exec call, got %d", len(mock.execCalls))
+	}
+}
+
 func TestBroker_Exec_EscalationAllow_BypassesApproval(t *testing.T) {
 	mgr := NewManager(&mockApprover{response: Deny}, "/dev/null", nil, WithEscalation("allow"))
 	mock := &mockRuntime{execResult: &container.ExecResult{ExitCode: 0}}

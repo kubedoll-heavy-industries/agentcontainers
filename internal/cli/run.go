@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -33,13 +34,24 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/signing"
 )
 
+var (
+	runRuntimeFactory       = newRuntime
+	runResolveSidecar       = resolveSidecar
+	runExtractPolicy        = orgpolicy.ExtractPolicy
+	runMergePolicy          = orgpolicy.MergePolicy
+	runVerifyImageSignature = verifyImageSignature
+	runNewDockerClient      = func() (client.APIClient, error) { return client.New(client.FromEnv) }
+	runStopSidecar          = sidecar.StopSidecar
+)
+
 func newRunCmd() *cobra.Command {
 	var (
-		detach             bool
-		timeout            time.Duration
-		configPath         string
-		runtimeFlag        string
-		insecureSkipVerify bool
+		detach                bool
+		timeout               time.Duration
+		configPath            string
+		runtimeFlag           string
+		insecureSkipVerify    bool
+		insecureSkipOrgPolicy bool
 	)
 
 	cmd := &cobra.Command{
@@ -53,7 +65,7 @@ Org policy is resolved automatically from the workspace hierarchy
 (.agentcontainers/policy.json) or from the lockfile's pinned digest.
 It cannot be overridden at runtime.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRun(cmd, detach, timeout, configPath, runtimeFlag, insecureSkipVerify)
+			return runRun(cmd, detach, timeout, configPath, runtimeFlag, insecureSkipVerify, insecureSkipOrgPolicy)
 		},
 	}
 
@@ -62,6 +74,7 @@ It cannot be overridden at runtime.`,
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to agentcontainer.json")
 	cmd.Flags().StringVar(&runtimeFlag, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
 	cmd.Flags().BoolVar(&insecureSkipVerify, "insecure-skip-verify", false, "Skip cosign signature verification (dev only)")
+	cmd.Flags().BoolVar(&insecureSkipOrgPolicy, "insecure-skip-org-policy", false, "Skip image org-policy extraction (dev/local images only)")
 
 	return cmd
 }
@@ -129,7 +142,7 @@ func policyImageRef(imageTag, cfgPath string) string {
 	return ref + "@" + lf.Resolved.Image.Digest
 }
 
-func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath string, runtimeFlag string, insecureSkipVerify bool) error {
+func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath string, runtimeFlag string, insecureSkipVerify bool, insecureSkipOrgPolicy bool) error {
 	// 0. Resolve "auto" to a concrete runtime type so all downstream checks
 	// (e.g. sandbox sidecar skip) work regardless of the original flag value.
 	resolvedRuntime := container.RuntimeType(runtimeFlag)
@@ -149,6 +162,10 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		return fmt.Errorf("run: invalid configuration: %w", err)
 	}
 
+	if err := verifyRunPolicyChannel(cmd.Context(), cfg, cfgPath, newOCIResolver()); err != nil {
+		return err
+	}
+
 	// 1b. Extract org policy from the image manifest and validate against
 	// workspace config. Policy is embedded in the image as a typed layer at
 	// build time (PRD-017). If no policy layer is found, DefaultPolicy() is
@@ -165,11 +182,17 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// regardless of tag mutation.
 	policyRef := policyImageRef(cfg.Image, cfgPath)
 
-	orgPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), policyRef)
-	if err != nil {
-		return fmt.Errorf("run: extracting org policy from image: %w", err)
+	orgPolicy := orgpolicy.DefaultPolicy()
+	if insecureSkipOrgPolicy {
+		logger.Warn("skipping image org-policy extraction (--insecure-skip-org-policy)")
+	} else {
+		var err error
+		orgPolicy, err = runExtractPolicy(cmd.Context(), policyRef)
+		if err != nil {
+			return fmt.Errorf("run: extracting org policy from image: %w", err)
+		}
 	}
-	if err := orgpolicy.MergePolicy(orgPolicy, cfg); err != nil {
+	if err := runMergePolicy(orgPolicy, cfg); err != nil {
 		return fmt.Errorf("run: org policy violation: %w", err)
 	}
 
@@ -177,7 +200,7 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// We verify against policyRef (the lockfile-pinned digest) so the
 	// signature check and the policy extraction operate on the same manifest.
 	if !insecureSkipVerify {
-		if err := verifyImageSignature(cmd, cfg, policyRef); err != nil {
+		if err := runVerifyImageSignature(cmd, cfg, policyRef); err != nil {
 			return fmt.Errorf("run: image signature verification failed: %w", err)
 		}
 	}
@@ -219,7 +242,7 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		enfSource = "in-vm"
 		logger.Info("sandbox runtime: in-VM enforcement, skipping host sidecar")
 	} else {
-		sidecarHandle, enfAddr, err = resolveSidecar(cmd, cfg)
+		sidecarHandle, enfAddr, err = runResolveSidecar(cmd, cfg)
 		if err != nil {
 			return fmt.Errorf("run: %w", err)
 		}
@@ -242,10 +265,18 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	}
 	logger.Info("enforcement level resolved", zap.String("level", enfLevel.String()), zap.String("source", enfSource))
 
-	rt, err := newRuntime(runtimeFlag, logger, enfLevel)
+	rt, err := runRuntimeFactory(string(resolvedRuntime), logger, enfLevel)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
+
+	sessionStarted := false
+	defer func() {
+		if sessionStarted || isSandbox || sidecarHandle == nil || !sidecarHandle.Managed {
+			return
+		}
+		stopManagedSidecar(cmd.OutOrStdout(), sidecarHandle)
+	}()
 
 	// 2b. Resolve secrets if configured.
 	var secretsMgr *secrets.Manager
@@ -265,7 +296,7 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	if cfg.Agent != nil {
 		caps = cfg.Agent.Capabilities
 	}
-	resolvedPolicy := policy.Resolve(caps)
+	resolvedPolicy := resolveRuntimePolicy(cfg)
 
 	// 3b. Apply policy config overrides.
 	var policyConfig *config.PolicyConfig
@@ -324,6 +355,7 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	if err != nil {
 		return fmt.Errorf("run: starting container: %w", err)
 	}
+	sessionStarted = true
 
 	// For sandbox, read enforcer address from the session (set by the runtime).
 	if isSandbox && session.EnforcerAddr != "" {
@@ -447,19 +479,85 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// Stop managed sidecar after agent container is stopped.
 	// (Sandbox runtime manages its own sidecar teardown in Stop().)
 	if !isSandbox && sidecarHandle != nil && sidecarHandle.Managed {
-		dockerCli, cliErr := client.New(client.FromEnv)
-		if cliErr == nil {
-			if stopErr := sidecar.StopSidecar(context.Background(), dockerCli, sidecarHandle); stopErr != nil {
-				logger.Warn("failed to stop agentcontainer-enforcer sidecar", zap.Error(stopErr))
-			} else {
-				_, _ = fmt.Fprintf(out, "Enforcer stopped\n")
-			}
-		} else {
-			logger.Warn("failed to create docker client for sidecar teardown", zap.Error(cliErr))
-		}
+		stopManagedSidecar(out, sidecarHandle)
 	}
 
 	return nil
+}
+
+func verifyRunPolicyChannel(ctx context.Context, cfg *config.AgentContainer, cfgPath string, fetcher policyBundleFetcher) error {
+	policyRef := configuredPolicyRef(cfg)
+	if policyRef == "" {
+		return nil
+	}
+	if cfgPath == "" {
+		return fmt.Errorf("run: mutable policy channel: config path is required")
+	}
+
+	lf, err := config.LoadLockfile(filepath.Dir(cfgPath))
+	if err != nil {
+		return fmt.Errorf("run: mutable policy channel: loading lockfile: %w", err)
+	}
+	if err := lf.Validate(); err != nil {
+		return fmt.Errorf("run: mutable policy channel: invalid lockfile: %w", err)
+	}
+	if lf.Resolved.Policy == nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s is not pinned in lockfile", policyRef)
+	}
+	if coverageIssues := requirePolicyChannelLockCoverage(cfg, lf); len(coverageIssues) > 0 {
+		var msgs []string
+		for _, issue := range coverageIssues {
+			msgs = append(msgs, issue.label+" is not pinned in lockfile")
+		}
+		return fmt.Errorf("run: mutable policy channel requires lockfile coverage: %s", strings.Join(msgs, "; "))
+	}
+
+	now := time.Now().UTC()
+	currentPolicy, bundle, err := resolvePolicyChannel(ctx, fetcher, policyRef, now)
+	if err != nil {
+		return fmt.Errorf("run: mutable policy channel: fetching policy %s: %w", policyRef, err)
+	}
+	if err := checkPolicyReplacement(lf.Resolved.Policy, currentPolicy); err != nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s: %w", policyRef, err)
+	}
+	if _, err := verifyPolicyChannelSignature(ctx, policyRef, currentPolicy.Digest, signing.VerifyOptions{}); err != nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s signature verification failed: %w", policyRef, err)
+	}
+	if issues := evaluatePolicyChannelArtifacts(cfg, lf, bundle, now); len(issues) > 0 {
+		var msgs []string
+		for _, issue := range issues {
+			msgs = append(msgs, fmt.Sprintf("%s: %v", issue.label, issue.err))
+		}
+		return fmt.Errorf("run: mutable policy channel denied artifact(s): %s", strings.Join(msgs, "; "))
+	}
+
+	return nil
+}
+
+func stopManagedSidecar(out io.Writer, handle *sidecar.SidecarHandle) {
+	dockerCli, cliErr := runNewDockerClient()
+	if cliErr != nil {
+		logger.Warn("failed to create docker client for sidecar teardown", zap.Error(cliErr))
+		return
+	}
+	if stopErr := runStopSidecar(context.Background(), dockerCli, handle); stopErr != nil {
+		logger.Warn("failed to stop agentcontainer-enforcer sidecar", zap.Error(stopErr))
+		return
+	}
+	_, _ = fmt.Fprintf(out, "Enforcer stopped\n")
+}
+
+func resolveRuntimePolicy(cfg *config.AgentContainer) *policy.ContainerPolicy {
+	var caps *config.Capabilities
+	if cfg != nil && cfg.Agent != nil {
+		caps = cfg.Agent.Capabilities
+	}
+
+	resolvedPolicy := policy.Resolve(caps)
+	if cfg != nil && cfg.Agent != nil {
+		resolvedPolicy.SecretACLs = policy.ResolveSecrets(cfg.Agent.Secrets, cfg.Agent.Tools)
+	}
+	return resolvedPolicy
 }
 
 // verifyImageSignature checks the cosign signature of imageRef when the
@@ -567,10 +665,25 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer) (*sidecar.Si
 	}
 
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Starting agentcontainer-enforcer sidecar...")
-	handle, err := sidecar.StartSidecar(cmd.Context(), dockerCli, sidecar.StartOptions{
+	startOpts := sidecar.StartOptions{
 		Image:    image,
 		Required: required,
-	})
+	}
+	if runtime.GOOS == "linux" {
+		socketDir, err := os.MkdirTemp("", "agentcontainer-enforcer-")
+		if err != nil {
+			if required {
+				return nil, "", fmt.Errorf("enforcer: creating socket dir: %w", err)
+			}
+			logger.Warn("could not create enforcer socket directory, falling back to random TCP", zap.Error(err))
+			startOpts.RandomHostPort = true
+		} else {
+			startOpts.SocketPath = filepath.Join(socketDir, "agentcontainer-enforcer.sock")
+		}
+	} else {
+		startOpts.RandomHostPort = true
+	}
+	handle, err := sidecar.StartSidecar(cmd.Context(), dockerCli, startOpts)
 	if err != nil {
 		return nil, "", fmt.Errorf("enforcer: %w", err)
 	}

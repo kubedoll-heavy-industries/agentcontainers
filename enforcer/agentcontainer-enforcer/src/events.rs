@@ -252,6 +252,94 @@ pub fn parse_cred_event(raw: &bpf::CredEvent, container_id: &str) -> Enforcement
     }
 }
 
+/// Parse a raw BPF [`bpf::BindEvent`] into an [`EnforcementEvent`].
+pub fn parse_bind_event(raw: &bpf::BindEvent, container_id: &str) -> EnforcementEvent {
+    let verdict = match raw.verdict {
+        1 => EventVerdict::Block,
+        _ => EventVerdict::Allow,
+    };
+
+    let proto_str = match raw.protocol {
+        6 => "tcp",
+        17 => "udp",
+        _ => "unknown",
+    };
+
+    let mut details = HashMap::new();
+    details.insert("port".into(), format!("{}", raw.port));
+    details.insert("protocol".into(), proto_str.into());
+
+    EnforcementEvent {
+        timestamp_ns: raw.timestamp_ns,
+        container_id: container_id.to_string(),
+        domain: EventDomain::Bind,
+        verdict,
+        pid: raw.pid,
+        comm: bytes_to_string(&raw.comm),
+        details,
+    }
+}
+
+/// Parse a raw BPF [`bpf::ReverseShellEvent`] into an [`EnforcementEvent`].
+pub fn parse_reverse_shell_event(
+    raw: &bpf::ReverseShellEvent,
+    container_id: &str,
+) -> EnforcementEvent {
+    let verdict = match raw.verdict {
+        1 => EventVerdict::Block,
+        _ => EventVerdict::Allow,
+    };
+
+    let mut details = HashMap::new();
+    details.insert("oldfd".into(), format!("{}", raw.oldfd));
+    details.insert("newfd".into(), format!("{}", raw.newfd));
+
+    EnforcementEvent {
+        timestamp_ns: raw.timestamp_ns,
+        container_id: container_id.to_string(),
+        domain: EventDomain::ReverseShell,
+        verdict,
+        pid: raw.pid,
+        comm: bytes_to_string(&raw.comm),
+        details,
+    }
+}
+
+/// Local mirror of the BPF-side MemfdEvent struct.
+///
+/// This struct is defined locally in the BPF program (`agentcontainer-ebpf`)
+/// rather than in `agentcontainer-common` because it is a detection-only event
+/// with no shared map key/value usage. We duplicate the layout here so the
+/// ring buffer reader can deserialize it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MemfdEvent {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub event_type: u32,
+    pub verdict: u32,
+    pub comm: [u8; bpf::COMM_MAX],
+}
+
+/// Parse a raw [`MemfdEvent`] into an [`EnforcementEvent`].
+pub fn parse_memfd_event(raw: &MemfdEvent, container_id: &str) -> EnforcementEvent {
+    let verdict = match raw.verdict {
+        1 => EventVerdict::Block,
+        _ => EventVerdict::Allow,
+    };
+
+    EnforcementEvent {
+        timestamp_ns: raw.timestamp_ns,
+        container_id: container_id.to_string(),
+        domain: EventDomain::Memfd,
+        verdict,
+        pid: raw.pid,
+        comm: bytes_to_string(&raw.comm),
+        details: HashMap::new(),
+    }
+}
+
 /// Parse a raw BPF [`bpf::DnsEvent`] into an [`EnforcementEvent`].
 ///
 /// DNS events are observation-only (always Allow). The domain name is
@@ -354,6 +442,7 @@ mod tests {
             uid: 0,
             event_type: bpf::EventType::ProcessExec as u32,
             verdict: bpf::Verdict::Block as u32,
+            cgroup_id: 0,
             inode: 99999,
             comm,
             binary,

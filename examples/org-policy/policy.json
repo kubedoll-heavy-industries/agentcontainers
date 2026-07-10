@@ -25,6 +25,5 @@
     "ghcr.io/your-org/mcp-tools/",
     "ghcr.io/modelcontextprotocol/servers/"
   ],
-  "maxAge": "7d",
   "maxDriftThreshold": 0.1
 }

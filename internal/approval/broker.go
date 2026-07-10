@@ -69,19 +69,41 @@ func (b *Broker) Stop(ctx context.Context, session *container.Session) error {
 // delegating to the wrapped runtime. If the command binary is not in the
 // allowlist and the manager denies the request, it returns an error.
 func (b *Broker) Exec(ctx context.Context, session *container.Session, cmd []string) (*container.ExecResult, error) {
+	if err := b.checkExecAllowed(cmd); err != nil {
+		return nil, err
+	}
+
+	return b.runtime.Exec(ctx, session, cmd)
+}
+
+// ExecInteractive checks approval and then delegates to runtimes that support
+// attached stdio.
+func (b *Broker) ExecInteractive(ctx context.Context, session *container.Session, cmd []string, execIO container.ExecIO) (int, error) {
+	if err := b.checkExecAllowed(cmd); err != nil {
+		return 0, err
+	}
+
+	rt, ok := b.runtime.(container.InteractiveExecutor)
+	if !ok {
+		return 0, fmt.Errorf("broker: runtime does not support interactive exec")
+	}
+	return rt.ExecInteractive(ctx, session, cmd, execIO)
+}
+
+func (b *Broker) checkExecAllowed(cmd []string) error {
 	if len(cmd) == 0 {
-		return nil, fmt.Errorf("broker: empty command rejected")
+		return fmt.Errorf("broker: empty command rejected")
 	}
 
 	if b.manager == nil {
-		return b.runtime.Exec(ctx, session, cmd)
+		return nil
 	}
 
 	binary := extractBinary(cmd[0])
 
 	// M3 defense-in-depth: block known interpreters with code-execution flags.
 	if knownInterpreters[binary] && len(cmd) > 1 && interpreterCodeFlags[cmd[1]] {
-		return nil, fmt.Errorf("broker: interpreter %q with %s flag denied (M3 defense-in-depth); use a script file instead", binary, cmd[1])
+		return fmt.Errorf("broker: interpreter %q with %s flag denied (M3 defense-in-depth); use a script file instead", binary, cmd[1])
 	}
 
 	// Build the request with the full command so the manager can check
@@ -98,13 +120,13 @@ func (b *Broker) Exec(ctx context.Context, session *container.Session, cmd []str
 
 	approved, err := b.manager.Check(req)
 	if err != nil {
-		return nil, fmt.Errorf("broker: checking shell capability: %w", err)
+		return fmt.Errorf("broker: checking shell capability: %w", err)
 	}
 	if !approved {
-		return nil, fmt.Errorf("broker: command %q denied by capability policy", binary)
+		return fmt.Errorf("broker: command %q denied by capability policy", binary)
 	}
 
-	return b.runtime.Exec(ctx, session, cmd)
+	return nil
 }
 
 // Logs delegates to the wrapped runtime.

@@ -1,10 +1,16 @@
 package enforcement
 
 import (
+	"net"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func TestLevel_String(t *testing.T) {
@@ -79,6 +85,37 @@ func TestDetectLevel_GRPCFromEnv(t *testing.T) {
 		// Should not be grpc since health check will fail
 		assert.NotEqual(t, LevelGRPC, level)
 	})
+}
+
+func TestProbeEnforcerHealth_UnixSocket(t *testing.T) {
+	socketDir, err := os.MkdirTemp("/tmp", "ac-uds-*")
+	if err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(socketDir)
+	})
+	socketPath := filepath.Join(socketDir, "enforcer.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Skipf("unix sockets unavailable in this test sandbox: %v", err)
+	}
+
+	server := grpc.NewServer()
+	healthServer := health.NewServer()
+	healthServer.SetServingStatus("agentcontainers.enforcer.v1.Enforcer", healthgrpc.HealthCheckResponse_SERVING)
+	healthgrpc.RegisterHealthServer(server, healthServer)
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	assert.Eventually(t, func() bool {
+		return ProbeEnforcerHealth("unix://" + socketPath)
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 func TestNewStrategy_GRPC_CreatesStrategy(t *testing.T) {

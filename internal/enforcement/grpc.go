@@ -6,7 +6,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -158,6 +160,11 @@ func NewGRPCStrategy(target string, opts ...GRPCOption) (*GRPCStrategy, error) {
 	}
 
 	dialOpts := []grpc.DialOption{}
+	if socketPath, ok := strings.CutPrefix(target, "unix://"); ok {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}))
+	}
 	if cfg.insecure {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else if cfg.tlsConfig != nil {
@@ -415,11 +422,18 @@ func (s *GRPCStrategy) startEventStream(containerID string) error {
 			}
 
 			event := translateEvent(protoEvent)
+			s.mu.Lock()
+			ch, ok := s.events[containerID]
+			if !ok {
+				s.mu.Unlock()
+				return
+			}
 			select {
-			case eventCh <- event:
+			case ch <- event:
 			default:
 				// Channel full, drop event
 			}
+			s.mu.Unlock()
 		}
 	}()
 

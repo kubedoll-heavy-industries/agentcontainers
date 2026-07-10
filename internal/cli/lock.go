@@ -11,6 +11,7 @@ import (
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oci"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/signing"
 )
 
 func newLockCmd() *cobra.Command {
@@ -93,7 +94,7 @@ func runLock(cmd *cobra.Command, configPath, outputPath string) error {
 	now := time.Now().UTC()
 
 	lf := &config.Lockfile{
-		Version:     1,
+		Version:     2,
 		GeneratedAt: now,
 		GeneratedBy: "agentcontainer",
 		Resolved:    config.ResolvedArtifacts{},
@@ -160,10 +161,19 @@ func runLock(cmd *cobra.Command, configPath, outputPath string) error {
 		}
 	}
 
-	// TODO: Org policy locking needs redesign. The policy is resolved from
-	// the workspace hierarchy (not from config), so agentcontainer lock needs a way to
-	// discover and pin the org policy OCI ref. This likely involves reading
-	// .agentcontainers/policy.json metadata or a dedicated policy registry.
+	if policyRef := configuredPolicyRef(cfg); policyRef != "" {
+		resolvedPolicy, _, err := resolvePolicyChannel(ctx, resolver, policyRef, now)
+		if err != nil {
+			return fmt.Errorf("lock: resolving policy %s: %w", policyRef, err)
+		}
+		signature, err := verifyPolicyChannelSignature(ctx, policyRef, resolvedPolicy.Digest, signing.VerifyOptions{})
+		if err != nil {
+			return fmt.Errorf("lock: verifying policy %s signature: %w", policyRef, err)
+		}
+		resolvedPolicy.Signature = signature
+		lf.Resolved.Policy = resolvedPolicy
+		_, _ = fmt.Fprintf(out, "  policy: %s -> %s (epoch %d)\n", policyRef, resolvedPolicy.Digest, resolvedPolicy.Epoch)
+	}
 
 	// 4. Determine output path.
 	if outputPath == "" {

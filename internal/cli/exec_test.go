@@ -2,11 +2,18 @@ package cli
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"go.uber.org/zap"
+
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/container"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/secrets"
 )
 
@@ -49,9 +56,9 @@ func TestExecFlagParsing(t *testing.T) {
 	}
 }
 
-func TestExecRequiresConfig(t *testing.T) {
-	// When no config file exists, exec should fail because the approval
-	// broker cannot determine what commands are allowed.
+func TestExecNoConfig_DefaultDeny(t *testing.T) {
+	// When no config file exists, exec proceeds with default-deny approval.
+	// The broker denies all commands because there are no declared capabilities.
 	tmp := t.TempDir()
 	origDir, _ := os.Getwd()
 	if err := os.Chdir(tmp); err != nil {
@@ -64,10 +71,10 @@ func TestExecRequiresConfig(t *testing.T) {
 
 	err := cmd.Execute()
 	if err == nil {
-		t.Fatal("expected error when no config file exists")
+		t.Fatal("expected error from default-deny broker")
 	}
-	if !strings.Contains(err.Error(), "no agentcontainer.json") {
-		t.Errorf("expected config-not-found error, got: %v", err)
+	if !strings.Contains(err.Error(), "denied") {
+		t.Errorf("expected denial error, got: %v", err)
 	}
 }
 
@@ -192,4 +199,148 @@ func TestResolveSecretOnDemand_InfisicalXORValidation(t *testing.T) {
 	if !strings.Contains(err.Error(), "must both be set") {
 		t.Errorf("error = %q, want contains 'must both be set'", err.Error())
 	}
+}
+
+func TestRunExec_InvalidDiscoveredConfigDoesNotFallback(t *testing.T) {
+	tmp := t.TempDir()
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	cfgPath := filepath.Join(tmp, "agentcontainer.json")
+	if err := os.WriteFile(cfgPath, []byte("{invalid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreExecRuntimeFactory(t, func(string, *zap.Logger, enforcement.Level) (container.Runtime, error) {
+		return &recordingRuntime{}, nil
+	})
+
+	cmd := newExecCmd()
+	err := runExec(cmd, "abc123", []string{"ls"}, "docker", "", nil, false)
+	if err == nil {
+		t.Fatal("expected config parse error")
+	}
+	if !strings.Contains(err.Error(), "parsing agentcontainer.json") {
+		t.Fatalf("expected parse error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "denied") {
+		t.Fatalf("expected parse error, got fallback denial: %v", err)
+	}
+}
+
+func TestRunExec_BareEnvUsesHostValue(t *testing.T) {
+	t.Setenv("INHERITED_KEY", "expected-value")
+
+	cfgPath := writeExecConfig(t, `{
+		"name": "test",
+		"image": "ubuntu",
+		"agent": {
+			"capabilities": {
+				"shell": {
+					"commands": [{"binary": "env"}]
+				}
+			},
+			"policy": {
+				"escalation": "allow"
+			}
+		}
+	}`)
+
+	rt := &recordingRuntime{
+		execResult: &container.ExecResult{ExitCode: 0},
+	}
+	restoreExecRuntimeFactory(t, func(string, *zap.Logger, enforcement.Level) (container.Runtime, error) {
+		return rt, nil
+	})
+
+	cmd := newExecCmd()
+	if err := runExec(cmd, "abc123", []string{"printenv", "INHERITED_KEY"}, "docker", cfgPath, []string{"INHERITED_KEY"}, false); err != nil {
+		t.Fatalf("runExec() error = %v", err)
+	}
+
+	want := []string{"env", "INHERITED_KEY=expected-value", "printenv", "INHERITED_KEY"}
+	if !reflect.DeepEqual(rt.execCmd, want) {
+		t.Fatalf("exec cmd = %v, want %v", rt.execCmd, want)
+	}
+}
+
+func TestRunExec_BareEnvMissingHostValueErrors(t *testing.T) {
+	cfgPath := writeExecConfig(t, `{
+		"name": "test",
+		"image": "ubuntu",
+		"agent": {
+			"capabilities": {
+				"shell": {
+					"commands": [{"binary": "env"}]
+				}
+			},
+			"policy": {
+				"escalation": "allow"
+			}
+		}
+	}`)
+
+	restoreExecRuntimeFactory(t, func(string, *zap.Logger, enforcement.Level) (container.Runtime, error) {
+		return &recordingRuntime{}, nil
+	})
+
+	cmd := newExecCmd()
+	err := runExec(cmd, "abc123", []string{"printenv", "MISSING_KEY"}, "docker", cfgPath, []string{"MISSING_KEY"}, false)
+	if err == nil {
+		t.Fatal("expected missing env error")
+	}
+	if !strings.Contains(err.Error(), `environment variable "MISSING_KEY" is not set`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+type recordingRuntime struct {
+	execCmd    []string
+	execResult *container.ExecResult
+	startErr   error
+}
+
+func (r *recordingRuntime) Start(context.Context, *config.AgentContainer, container.StartOptions) (*container.Session, error) {
+	if r.startErr != nil {
+		return nil, r.startErr
+	}
+	return &container.Session{ContainerID: "session-123", RuntimeType: container.RuntimeDocker}, nil
+}
+
+func (r *recordingRuntime) Stop(context.Context, *container.Session) error { return nil }
+
+func (r *recordingRuntime) Exec(_ context.Context, _ *container.Session, cmd []string) (*container.ExecResult, error) {
+	r.execCmd = append([]string(nil), cmd...)
+	if r.execResult != nil {
+		return r.execResult, nil
+	}
+	return &container.ExecResult{ExitCode: 0}, nil
+}
+
+func (r *recordingRuntime) Logs(context.Context, *container.Session) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (r *recordingRuntime) List(context.Context, bool) ([]*container.Session, error) { return nil, nil }
+
+func restoreExecRuntimeFactory(t *testing.T, fn func(string, *zap.Logger, enforcement.Level) (container.Runtime, error)) {
+	t.Helper()
+	prev := execRuntimeFactory
+	execRuntimeFactory = fn
+	t.Cleanup(func() {
+		execRuntimeFactory = prev
+	})
+}
+
+func writeExecConfig(t *testing.T, contents string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agentcontainer.json")
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
 }

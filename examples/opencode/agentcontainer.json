@@ -1,0 +1,25 @@
+{
+  // OpenCode agent using GitHub Copilot (free tier) — no API key needed.
+  // Requires GitHub Copilot auth: run `gh auth login` or have VS Code Copilot extension installed.
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "agent": {
+    "capabilities": {
+      "network": {
+        "egress": [
+          { "host": "api.github.com", "port": 443 },
+          { "host": "api.githubcopilot.com", "port": 443 },
+          { "host": "copilot-proxy.githubusercontent.com", "port": 443 }
+        ]
+      },
+      "shell": {
+        "commands": ["opencode", "git"]
+      },
+      "filesystem": {
+        "read": ["/workspace"],
+        "write": ["/workspace"]
+      }
+    }
+  }
+}

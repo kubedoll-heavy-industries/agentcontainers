@@ -10,6 +10,7 @@
 //! write lock.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use sha2::{Digest as ShaDigest, Sha256};
@@ -359,9 +360,16 @@ impl Enforcer for EnforcerService {
             }
         }
 
-        let proc_policy = policy::ProcessPolicy {
-            allowed_binaries: req.allowed_binaries,
+        let allowed_binaries = if let Some(init_pid) = {
+            let pids = self.container_pids.read().await;
+            pids.get(&req.container_id).copied()
+        } {
+            resolve_process_binaries(init_pid, &req.allowed_binaries)?
+        } else {
+            req.allowed_binaries
         };
+
+        let proc_policy = policy::ProcessPolicy { allowed_binaries };
 
         match self
             .manager
@@ -966,6 +974,229 @@ impl Enforcer for EnforcerService {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Deny-set, bind, and reverse shell RPCs
+    // -----------------------------------------------------------------------
+
+    async fn apply_deny_set_policy(
+        &self,
+        request: Request<ApplyDenySetPolicyRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            entries = req.allowed_entries.len(),
+            transitions = req.transitions.len(),
+            "applying deny-set policy"
+        );
+
+        // Look up init_pid from the registered containers.
+        let init_pid = {
+            let pids = self.container_pids.read().await;
+            pids.get(&req.container_id).copied().ok_or_else(|| {
+                Status::not_found(format!("container {} not registered", req.container_id))
+            })?
+        };
+
+        // Resolve each DenySetEntry through the same container-root path
+        // validator used by process policy. Do not concatenate untrusted gRPC
+        // paths into /proc/<pid>/root.
+        let mut resolved_entries = Vec::with_capacity(req.allowed_entries.len());
+        for entry in &req.allowed_entries {
+            let proc_path = resolve_deny_set_binary(init_pid, &entry.binary_path)?;
+            let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
+            resolved_entries.push(policy::ResolvedDenySetEntry {
+                deny_set_id: entry.deny_set_id,
+                inode,
+                dev_major,
+                dev_minor,
+            });
+        }
+
+        // Resolve each DenySetTransition child binary through the validated
+        // container-root resolver.
+        let mut resolved_transitions = Vec::with_capacity(req.transitions.len());
+        for t in &req.transitions {
+            let proc_path = resolve_deny_set_binary(init_pid, &t.child_binary_path)?;
+            let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
+            resolved_transitions.push(policy::ResolvedDenySetTransition {
+                parent_deny_set_id: t.parent_deny_set_id,
+                child_inode: inode,
+                child_dev_major: dev_major,
+                child_dev_minor: dev_minor,
+                child_deny_set_id: t.child_deny_set_id,
+            });
+        }
+
+        let deny_set_policy = policy::DenySetPolicy {
+            entries: resolved_entries,
+            transitions: resolved_transitions,
+            init_pid,
+            init_deny_set_id: req.init_deny_set_id,
+        };
+
+        match self
+            .manager
+            .apply_deny_set(&req.container_id, &deny_set_policy)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn update_deny_set_policy(
+        &self,
+        request: Request<UpdateDenySetPolicyRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            deny_set_id = req.deny_set_id,
+            binary_path = %req.binary_path,
+            "updating deny-set policy entry"
+        );
+
+        // Look up init_pid from the registered containers.
+        let init_pid = {
+            let pids = self.container_pids.read().await;
+            pids.get(&req.container_id).copied().ok_or_else(|| {
+                Status::not_found(format!("container {} not registered", req.container_id))
+            })?
+        };
+
+        // Stat the binary via the validated /proc/<init_pid>/root resolver.
+        let proc_path = resolve_deny_set_binary(init_pid, &req.binary_path)?;
+        let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
+
+        let entry = policy::ResolvedDenySetEntry {
+            deny_set_id: req.deny_set_id,
+            inode,
+            dev_major,
+            dev_minor,
+        };
+
+        match self
+            .manager
+            .update_deny_set(&req.container_id, &entry)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn apply_bind_policy(
+        &self,
+        request: Request<BindPolicyRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            rules = req.allowed_binds.len(),
+            "applying bind policy"
+        );
+
+        // Validate port ranges before casting to u16.
+        for r in &req.allowed_binds {
+            if r.port > 65535 {
+                return Ok(Response::new(PolicyResponse {
+                    success: false,
+                    error: format!("port out of range: {}", r.port),
+                }));
+            }
+        }
+
+        let bind_policy = policy::BindPolicy {
+            rules: req
+                .allowed_binds
+                .into_iter()
+                .map(|r| {
+                    let protocol = match r.protocol.as_str() {
+                        "tcp" => 6u8,
+                        "udp" => 17u8,
+                        _ => 0u8,
+                    };
+                    policy::BindRule {
+                        port: r.port as u16,
+                        protocol,
+                    }
+                })
+                .collect(),
+        };
+
+        match self
+            .manager
+            .apply_bind(&req.container_id, &bind_policy)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn configure_reverse_shell_detection(
+        &self,
+        request: Request<ReverseShellConfigRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            mode = %req.mode,
+            "configuring reverse shell detection"
+        );
+
+        let mode = match req.mode.as_str() {
+            "enforce" => 0u8,
+            "log" => 1u8,
+            "off" => 2u8,
+            other => {
+                return Ok(Response::new(PolicyResponse {
+                    success: false,
+                    error: format!(
+                        "unknown mode {:?}: expected \"enforce\", \"log\", or \"off\"",
+                        other
+                    ),
+                }));
+            }
+        };
+
+        let config = policy::ReverseShellConfig { mode };
+
+        match self
+            .manager
+            .configure_reverse_shell(&req.container_id, &config)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
     async fn inject_secrets(
         &self,
         request: Request<InjectSecretsRequest>,
@@ -1044,6 +1275,73 @@ impl Enforcer for EnforcerService {
             injected_count: count,
         }))
     }
+}
+
+/// Stat a binary path and return (inode, dev_major, dev_minor).
+///
+/// Used by deny-set handlers to resolve binary paths inside a container's
+/// root filesystem via `/proc/<pid>/root/<path>`.
+fn stat_binary(path: &str) -> Result<(u64, u32, u32), Status> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Status::internal(format!("failed to stat {}: {}", path, e)))?;
+    let dev = meta.dev();
+    let dev_major = (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32;
+    let dev_minor = ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32;
+    Ok((meta.ino(), dev_major, dev_minor))
+}
+
+fn resolve_process_binaries(init_pid: u32, binaries: &[String]) -> Result<Vec<String>, Status> {
+    let mut resolved = Vec::with_capacity(binaries.len());
+    for binary in binaries {
+        resolved.push(resolve_process_binary(init_pid, binary)?);
+    }
+    Ok(resolved)
+}
+
+fn resolve_deny_set_binary(init_pid: u32, binary: &str) -> Result<String, Status> {
+    if !binary.starts_with('/') {
+        return Err(Status::invalid_argument(
+            "deny-set binary path must be absolute",
+        ));
+    }
+    resolve_process_binary(init_pid, binary)
+}
+
+fn resolve_process_binary(init_pid: u32, binary: &str) -> Result<String, Status> {
+    if binary.trim().is_empty() {
+        return Err(Status::invalid_argument("process binary must not be empty"));
+    }
+    if binary.contains("..") {
+        return Err(Status::invalid_argument(
+            "process binary must not contain '..'",
+        ));
+    }
+
+    let proc_root = format!("/proc/{}/root", init_pid);
+    if binary.starts_with('/') {
+        let candidate = format!("{}{}", proc_root, binary);
+        if Path::new(&candidate).exists() {
+            return Ok(candidate);
+        }
+        return Err(Status::invalid_argument(format!(
+            "allowed binary {} does not exist in container root",
+            binary
+        )));
+    }
+
+    for dir in ["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin"] {
+        let candidate = format!("{proc_root}{dir}/{binary}");
+        if Path::new(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(Status::invalid_argument(format!(
+        "allowed binary {} could not be resolved in container PATH",
+        binary
+    )))
 }
 
 /// Create the gRPC server with a given policy manager.
@@ -1391,6 +1689,20 @@ mod tests {
         );
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_resolve_deny_set_binary_rejects_relative_path() {
+        let err = resolve_deny_set_binary(12345, "bin/sh").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must be absolute"));
+    }
+
+    #[test]
+    fn test_resolve_deny_set_binary_rejects_path_traversal() {
+        let err = resolve_deny_set_binary(12345, "/../../../etc/shadow").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must not contain '..'"));
     }
 
     #[tokio::test]

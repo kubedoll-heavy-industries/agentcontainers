@@ -63,6 +63,87 @@ func TestParseFile_MinimalJSON(t *testing.T) {
 	}
 }
 
+func TestParseFile_ExplicitEmptyCapabilitiesStayExplicit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agentcontainer.json")
+	data := []byte(`{
+  "name": "empty-capabilities",
+  "image": "alpine:3.19",
+  "agent": {
+    "capabilities": {
+      "filesystem": {
+        "read": [],
+        "write": [],
+        "deny": []
+      },
+      "network": {
+        "egress": [],
+        "deny": []
+      },
+      "shell": {
+        "commands": []
+      },
+      "git": {
+        "operations": [],
+        "branches": {
+          "push": [],
+          "deny": []
+        }
+      }
+    }
+  }
+}`)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	cfg, err := parseFile(path)
+	if err != nil {
+		t.Fatalf("parseFile() unexpected error: %v", err)
+	}
+	if cfg.Agent == nil {
+		t.Fatal("Agent is nil, want explicit agent")
+	}
+	if cfg.Agent.Capabilities == nil {
+		t.Fatal("Agent.Capabilities is nil, want explicit capabilities")
+	}
+
+	caps := cfg.Agent.Capabilities
+	if caps.Filesystem == nil {
+		t.Fatal("Filesystem is nil, want explicit empty filesystem capabilities")
+	}
+	if caps.Filesystem.Read == nil || caps.Filesystem.Write == nil || caps.Filesystem.Deny == nil {
+		t.Fatalf("filesystem slices should stay explicit empty slices, got read=%v write=%v deny=%v",
+			caps.Filesystem.Read, caps.Filesystem.Write, caps.Filesystem.Deny)
+	}
+	if caps.Network == nil {
+		t.Fatal("Network is nil, want explicit empty network capabilities")
+	}
+	if caps.Network.Egress == nil || caps.Network.Deny == nil {
+		t.Fatalf("network slices should stay explicit empty slices, got egress=%v deny=%v",
+			caps.Network.Egress, caps.Network.Deny)
+	}
+	if caps.Shell == nil {
+		t.Fatal("Shell is nil, want explicit empty shell capabilities")
+	}
+	if caps.Shell.Commands == nil {
+		t.Fatal("Shell.Commands is nil, want explicit empty slice")
+	}
+	if caps.Git == nil {
+		t.Fatal("Git is nil, want explicit empty git capabilities")
+	}
+	if caps.Git.Operations == nil {
+		t.Fatal("Git.Operations is nil, want explicit empty slice")
+	}
+	if caps.Git.Branches == nil {
+		t.Fatal("Git.Branches is nil, want explicit empty branch capabilities")
+	}
+	if caps.Git.Branches.Push == nil || caps.Git.Branches.Deny == nil {
+		t.Fatalf("branch slices should stay explicit empty slices, got push=%v deny=%v",
+			caps.Git.Branches.Push, caps.Git.Branches.Deny)
+	}
+}
+
 func TestParseFile_JSONC(t *testing.T) {
 	cfg, err := parseFile(filepath.Join("testdata", "with_comments.jsonc"))
 	if err != nil {
@@ -674,6 +755,31 @@ func TestValidate(t *testing.T) {
 					},
 				},
 			},
+		},
+		{
+			name: "accepts valid provenance policy channel",
+			cfg: AgentContainer{
+				Name:  "test",
+				Image: "alpine:3",
+				Agent: &AgentConfig{
+					Provenance: &ProvenanceConfig{
+						Policy: &PolicyChannelConfig{Ref: "ghcr.io/acme/agentcontainers-policy:prod"},
+					},
+				},
+			},
+		},
+		{
+			name: "rejects empty provenance policy ref",
+			cfg: AgentContainer{
+				Name:  "test",
+				Image: "alpine:3",
+				Agent: &AgentConfig{
+					Provenance: &ProvenanceConfig{
+						Policy: &PolicyChannelConfig{Ref: " \t "},
+					},
+				},
+			},
+			wantErr: "agent.provenance.policy.ref: must not be empty",
 		},
 		{
 			name: "rejects invalid slsaLevel",

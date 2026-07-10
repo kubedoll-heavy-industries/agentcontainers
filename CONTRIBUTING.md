@@ -17,13 +17,21 @@ Thank you for your interest in contributing. This document covers how to get set
 - Docker Desktop (macOS) or Docker Engine (Linux)
 - Rust toolchain (only needed if changing the enforcer in `enforcer/`)
 
+If you are making a Go, docs, config, example, or CLI change, you do not need
+the Rust/eBPF toolchain for the first local pass.
+
 ```bash
 git clone https://github.com/Kubedoll-Heavy-Industries/agentcontainers
 cd agentcontainers
 mise install        # installs Go, golangci-lint, air, and other toolchain deps
 mise run build      # builds the agentcontainer binary to tmp/agentcontainer
 mise run test       # go test -race ./...
+tmp/agentcontainer version
 ```
+
+Expected result: `mise run build` creates `tmp/agentcontainer`, `mise run test`
+finishes without failures, and `tmp/agentcontainer version` prints the local
+binary version/build metadata.
 
 **Before every pull request:**
 
@@ -32,6 +40,36 @@ go build ./... && go vet ./... && go test -race ./...
 ```
 
 All three must pass with no errors or warnings.
+
+### Fifteen-Minute Contributor Check
+
+Use this when you are setting up the project for the first time:
+
+```bash
+mise install
+mise run build
+mise run test
+tmp/agentcontainer version
+```
+
+That path exercises the Go CLI and unit test suite without requiring Docker,
+privileged eBPF loading, a running agent, cloud credentials, or a secrets
+backend. Docker-backed, Sandbox-backed, TypeScript testcontainers, and
+Rust/eBPF checks are separate tiers.
+
+If this quick check fails, open a bug report with the command output, OS,
+Docker version if installed, and `go version`.
+
+### Test Tiers
+
+| Command | Requires | Use when |
+|---------|----------|----------|
+| `mise run test` | Go toolchain | Default check for Go, CLI, config, policy, docs-adjacent changes |
+| `go build ./... && go vet ./... && go test -race ./...` | Go toolchain | Required before PRs that change Go behavior |
+| `mise run test:dogfood` | Docker | Adversarial canary and Docker dogfood changes |
+| `mise run test:integration:ts` | Docker, Node/npm | TypeScript testcontainers harness changes |
+| `mise run enforcer:test` | Docker with privileged test container support | Rust/eBPF enforcer changes |
+| `cd enforcer && cargo check && cargo test` | Rust toolchain | Rust-only compile/unit checks that do not need privileged BPF loading |
 
 ## Repository Layout
 
@@ -48,6 +86,26 @@ All three must pass with no errors or warnings.
 | `internal/secrets/` | Secret URI parsing and provider implementations (Vault, 1Password, Infisical, OIDC, env). |
 | `internal/approval/` | Human-in-the-loop capability approval broker. |
 | `enforcer/` | Rust workspace: `agentcontainer-ebpf` (Aya BPF programs), `agentcontainer-enforcer` (Tokio gRPC server), `agentcontainer-common`. |
+
+## Where To Start
+
+Good first contributions usually live in areas that have fast tests and low
+blast radius:
+
+- `internal/config/`: schema parsing, validation, and JSONC fixtures.
+- `internal/policy/`: capability-to-policy translation tests.
+- `internal/cli/`: focused command behavior and help text tests.
+- `internal/dojo/` and `test/adversarial/`: adversarial profile fixtures and
+  canary-harness coverage.
+- `examples/` and `docs/src/content/docs/`: runnable examples and user-facing
+  docs.
+
+Coordinate with maintainers before taking on these areas:
+
+- `enforcer/`: Rust, Aya eBPF, kernel hooks, privileged integration tests.
+- `internal/container/runtime.go`: shared runtime interfaces.
+- `internal/config/config.go`: schema shape used by every layer.
+- OCI policy channel, signing, and secrets-provider behavior.
 
 ## Code Conventions
 

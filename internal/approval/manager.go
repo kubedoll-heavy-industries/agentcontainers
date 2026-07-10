@@ -68,15 +68,6 @@ func (m *Manager) Check(req Request) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Apply escalation policy before any checks.
-	switch m.escalation {
-	case "deny":
-		return false, nil
-	case "allow":
-		return true, nil
-	}
-	// "prompt" or empty: fall through to existing logic.
-
 	// Check if already approved in baseline.
 	if m.isApprovedInBaseline(req) {
 		return true, nil
@@ -86,6 +77,17 @@ func (m *Manager) Check(req Request) (bool, error) {
 	if m.isApprovedInSession(req) {
 		return true, nil
 	}
+
+	// Apply escalation policy only to requests outside the declared baseline
+	// and current session. "deny" means no new privilege escalation, not
+	// default-deny for explicitly configured capabilities.
+	switch m.escalation {
+	case "deny":
+		return false, nil
+	case "allow":
+		return true, nil
+	}
+	// "prompt" or empty: fall through to interactive approval.
 
 	// Prompt user for approval.
 	resp, err := m.approver.Prompt(req)

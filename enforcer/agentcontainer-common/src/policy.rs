@@ -55,6 +55,60 @@ pub struct ProcessPolicy {
     pub allowed_binaries: Vec<String>,
 }
 
+/// A resolved deny-set entry with inode/device info from stat.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug)]
+pub struct ResolvedDenySetEntry {
+    pub deny_set_id: u32,
+    pub inode: u64,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+}
+
+/// A resolved deny-set transition with inode/device info from stat.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug)]
+pub struct ResolvedDenySetTransition {
+    pub parent_deny_set_id: u32,
+    pub child_inode: u64,
+    pub child_dev_major: u32,
+    pub child_dev_minor: u32,
+    pub child_deny_set_id: u32,
+}
+
+/// Deny-set process-tree policy for a single container.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug, Default)]
+pub struct DenySetPolicy {
+    pub entries: Vec<ResolvedDenySetEntry>,
+    pub transitions: Vec<ResolvedDenySetTransition>,
+    pub init_pid: u32,
+    pub init_deny_set_id: u32,
+}
+
+/// Bind (listen) policy for a single container.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug, Default)]
+pub struct BindPolicy {
+    pub rules: Vec<BindRule>,
+}
+
+/// A single bind rule: port + protocol.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug)]
+pub struct BindRule {
+    pub port: u16,
+    pub protocol: u8,
+}
+
+/// Reverse shell detection configuration.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug)]
+pub struct ReverseShellConfig {
+    /// 0 = enforce, 1 = log, 2 = off
+    pub mode: u8,
+}
+
 /// Credential access policy for a single container.
 #[cfg(feature = "std")]
 #[derive(Clone, Debug, Default)]

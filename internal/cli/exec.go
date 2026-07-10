@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -16,11 +17,14 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/secrets"
 )
 
+var execRuntimeFactory = newRuntime
+
 func newExecCmd() *cobra.Command {
 	var (
-		runtime    string
-		configPath string
-		envVars    []string
+		runtime     string
+		configPath  string
+		envVars     []string
+		interactive bool
 	)
 
 	cmd := &cobra.Command{
@@ -41,33 +45,42 @@ Environment variables can be injected with -e KEY=VALUE. Secret URI schemes
 			cmdArgs := args[1:]
 
 			if len(cmdArgs) == 0 {
-				return fmt.Errorf("exec: no command specified (usage: ac exec <container-id> -- <command> [args...])")
+				return fmt.Errorf("exec: no command specified (usage: agentcontainer exec <container-id> -- <command> [args...])")
 			}
 
-			return runExec(cmd, containerID, cmdArgs, runtime, configPath, envVars)
+			return runExec(cmd, containerID, cmdArgs, runtime, configPath, envVars, interactive)
 		},
 	}
 
 	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to agentcontainer.json")
 	cmd.Flags().StringArrayVarP(&envVars, "env", "e", nil, "Set environment variables (KEY=VALUE or KEY=op://...)")
+	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "Attach stdin and allocate a TTY for interactive commands")
 
 	return cmd
 }
 
-func runExec(cmd *cobra.Command, containerID string, execCmd []string, runtimeFlag string, configPath string, envVars []string) error {
+func runExec(cmd *cobra.Command, containerID string, execCmd []string, runtimeFlag string, configPath string, envVars []string, interactive bool) error {
 	// BPF enforcement is already active on the container's cgroup from agentcontainer run.
 	// The runtime here only needs LevelNone because we are not re-applying
 	// policy — the approval broker provides the Go-side defense-in-depth.
-	rt, err := newRuntime(runtimeFlag, logger, enforcement.LevelNone)
+	rt, err := execRuntimeFactory(runtimeFlag, logger, enforcement.LevelNone)
 	if err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}
 
-	// Load config to wire the approval broker.
+	// Load config to wire the approval broker. Config is optional for exec —
+	// the container is already running with BPF enforcement from `run`. Without
+	// a config, exec runs with default-deny approval (every command prompted).
 	cfg, cfgPath, err := loadConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("exec: %w", err)
+		if configPath == "" && isConfigAbsent(err) {
+			// No config found — run with empty capabilities (default-deny approval).
+			cfg = &config.AgentContainer{}
+			cfgPath = ""
+		} else {
+			return err
+		}
 	}
 
 	var caps *config.Capabilities
@@ -96,28 +109,10 @@ func runExec(cmd *cobra.Command, containerID string, execCmd []string, runtimeFl
 	// Resolve any secret URI schemes in the --env flag values before executing.
 	// Values like KEY=op://vault/item/field are resolved on demand using a
 	// temporary single-provider Manager that is torn down after resolution.
-	var resolvedEnv []string
-	for _, envStr := range envVars {
-		parts := strings.SplitN(envStr, "=", 2)
-		if len(parts) != 2 {
-			// No "=" — pass through unchanged; the container will handle it.
-			resolvedEnv = append(resolvedEnv, envStr)
-			continue
-		}
-		ref, ok := secrets.ParseSecretURI(parts[1])
-		if !ok {
-			// Plain value — pass through as-is.
-			resolvedEnv = append(resolvedEnv, envStr)
-			continue
-		}
-		ref.Name = parts[0]
-		secret, err := resolveSecretOnDemand(cmd.Context(), ref)
-		if err != nil {
-			return fmt.Errorf("exec: resolving secret for env %q: %w", parts[0], err)
-		}
-		resolvedEnv = append(resolvedEnv, parts[0]+"="+string(secret.Value))
+	resolvedEnv, err := resolveExecEnv(cmd.Context(), envVars)
+	if err != nil {
+		return fmt.Errorf("exec: %w", err)
 	}
-
 	// The Runtime.Exec interface only accepts a command slice. When env vars
 	// have been resolved, prepend them to the command via POSIX `env` so that
 	// the container process sees the correct environment without requiring an
@@ -131,6 +126,22 @@ func runExec(cmd *cobra.Command, containerID string, execCmd []string, runtimeFl
 	session := &container.Session{
 		ContainerID: containerID,
 		RuntimeType: container.RuntimeType(runtimeFlag),
+	}
+
+	if interactive {
+		exitCode, err := brokerRT.ExecInteractive(cmd.Context(), session, finalCmd, container.ExecIO{
+			Stdin:  cmd.InOrStdin(),
+			Stdout: cmd.OutOrStdout(),
+			Stderr: cmd.ErrOrStderr(),
+			TTY:    true,
+		})
+		if err != nil {
+			return fmt.Errorf("exec: %w", err)
+		}
+		if exitCode != 0 {
+			return fmt.Errorf("exec: command exited with code %d", exitCode)
+		}
+		return nil
 	}
 
 	result, err := brokerRT.Exec(cmd.Context(), session, finalCmd)
@@ -150,6 +161,38 @@ func runExec(cmd *cobra.Command, containerID string, execCmd []string, runtimeFl
 	}
 
 	return nil
+}
+
+func resolveExecEnv(ctx context.Context, envVars []string) ([]string, error) {
+	var resolvedEnv []string
+	for _, envStr := range envVars {
+		parts := strings.SplitN(envStr, "=", 2)
+		if len(parts) != 2 {
+			value, ok := os.LookupEnv(envStr)
+			if !ok {
+				return nil, fmt.Errorf("environment variable %q is not set", envStr)
+			}
+			resolvedEnv = append(resolvedEnv, envStr+"="+value)
+			continue
+		}
+		ref, ok := secrets.ParseSecretURI(parts[1])
+		if !ok {
+			// Plain value — pass through as-is.
+			resolvedEnv = append(resolvedEnv, envStr)
+			continue
+		}
+		ref.Name = parts[0]
+		secret, err := resolveSecretOnDemand(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("resolving secret for env %q: %w", parts[0], err)
+		}
+		resolvedEnv = append(resolvedEnv, parts[0]+"="+string(secret.Value))
+	}
+	return resolvedEnv, nil
+}
+
+func isConfigAbsent(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no agentcontainer.json or devcontainer.json found")
 }
 
 // resolveSecretOnDemand creates a temporary Manager, registers the single

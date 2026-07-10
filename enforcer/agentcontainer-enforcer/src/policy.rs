@@ -13,7 +13,9 @@ use tonic::async_trait;
 
 // Re-export policy data types from agentcontainer-common (the single source of truth).
 pub use agentcontainer_common::policy::{
-    CredentialPolicy, EgressRule, FilesystemPolicy, NetworkPolicy, ProcessPolicy, SecretAcl,
+    BindPolicy, BindRule, CredentialPolicy, DenySetPolicy, EgressRule, FilesystemPolicy,
+    NetworkPolicy, ProcessPolicy, ResolvedDenySetEntry, ResolvedDenySetTransition,
+    ReverseShellConfig, SecretAcl,
 };
 
 /// Per-container enforcement context returned by [`PolicyManager::register`].
@@ -54,6 +56,9 @@ pub enum EventDomain {
     Filesystem,
     Process,
     Credential,
+    Bind,
+    ReverseShell,
+    Memfd,
 }
 
 impl EventDomain {
@@ -63,6 +68,9 @@ impl EventDomain {
             Self::Filesystem => "filesystem",
             Self::Process => "process",
             Self::Credential => "credential",
+            Self::Bind => "bind",
+            Self::ReverseShell => "reverse_shell",
+            Self::Memfd => "memfd",
         }
     }
 }
@@ -120,6 +128,30 @@ pub trait PolicyManager: Send + Sync + 'static {
         &self,
         container_id: &str,
         policy: &CredentialPolicy,
+    ) -> anyhow::Result<()>;
+
+    /// Apply deny-set process-tree policy for a container.
+    async fn apply_deny_set(
+        &self,
+        container_id: &str,
+        policy: &DenySetPolicy,
+    ) -> anyhow::Result<()>;
+
+    /// Update a single deny-set entry (add one binary to an existing set).
+    async fn update_deny_set(
+        &self,
+        container_id: &str,
+        entry: &ResolvedDenySetEntry,
+    ) -> anyhow::Result<()>;
+
+    /// Apply bind (listen) policy for a container.
+    async fn apply_bind(&self, container_id: &str, policy: &BindPolicy) -> anyhow::Result<()>;
+
+    /// Configure reverse shell detection mode for a container.
+    async fn configure_reverse_shell(
+        &self,
+        container_id: &str,
+        config: &ReverseShellConfig,
     ) -> anyhow::Result<()>;
 
     /// Get enforcement stats for a container (empty string = aggregate).
@@ -182,6 +214,34 @@ impl PolicyManager for StubPolicyManager {
         &self,
         _container_id: &str,
         _policy: &CredentialPolicy,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn apply_deny_set(
+        &self,
+        _container_id: &str,
+        _policy: &DenySetPolicy,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn update_deny_set(
+        &self,
+        _container_id: &str,
+        _entry: &ResolvedDenySetEntry,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn apply_bind(&self, _container_id: &str, _policy: &BindPolicy) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn configure_reverse_shell(
+        &self,
+        _container_id: &str,
+        _config: &ReverseShellConfig,
     ) -> anyhow::Result<()> {
         Ok(())
     }

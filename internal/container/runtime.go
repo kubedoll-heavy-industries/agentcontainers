@@ -132,6 +132,21 @@ type EventStreamer interface {
 	EnforcementEvents(containerID string) <-chan enforcement.Event
 }
 
+// ExecIO configures an attached exec session.
+type ExecIO struct {
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+	TTY    bool
+}
+
+// InteractiveExecutor is implemented by runtimes that can attach local stdio
+// to an exec session. It is optional so non-interactive runtimes can still
+// satisfy Runtime.
+type InteractiveExecutor interface {
+	ExecInteractive(ctx context.Context, session *Session, cmd []string, io ExecIO) (int, error)
+}
+
 // ExecResult holds the output of an executed command.
 type ExecResult struct {
 	// ExitCode is the process exit code. Zero indicates success.

@@ -1,0 +1,30 @@
+{
+  // Claude Code agent running in an agentcontainer.
+  // Requires an Anthropic API key — set ANTHROPIC_API_KEY in your environment.
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "agent": {
+    "capabilities": {
+      "network": {
+        "egress": [
+          { "host": "api.anthropic.com", "port": 443 },
+          { "host": "sentry.io", "port": 443 },
+          { "host": "statsig.anthropic.com", "port": 443 }
+        ]
+      },
+      "shell": {
+        "commands": ["claude", "node", "npm", "git"]
+      },
+      "filesystem": {
+        "read": ["/workspace"],
+        "write": ["/workspace"]
+      }
+    },
+    "secrets": {
+      "ANTHROPIC_API_KEY": {
+        "provider": "env://ANTHROPIC_API_KEY"
+      }
+    }
+  }
+}

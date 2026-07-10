@@ -15,6 +15,7 @@ import (
 
 func TestLockfile_Validate(t *testing.T) {
 	now := time.Date(2026, 1, 28, 0, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(24 * time.Hour)
 
 	tests := []struct {
 		name    string
@@ -83,6 +84,18 @@ func TestLockfile_Validate(t *testing.T) {
 								EmbeddingHash: "sha256:embed01",
 								Capabilities:  []string{"filesystem.read", "git.diff"},
 							},
+						},
+					},
+					Policy: &ResolvedPolicy{
+						Ref:        "ghcr.io/acme/org-policy:stable",
+						Digest:     "sha256:policy01",
+						Epoch:      7,
+						ExpiresAt:  expiresAt,
+						ResolvedAt: now,
+						Signature: &SignatureRef{
+							KeylessRef: "https://rekor.sigstore.dev/api/v1/log/entries/policy",
+							Issuer:     "https://token.actions.githubusercontent.com",
+							Subject:    "https://github.com/acme/org-policy/.github/workflows/release.yml@refs/tags/v7",
 						},
 					},
 				},
@@ -251,6 +264,94 @@ func TestLockfile_Validate(t *testing.T) {
 			wantErr: "resolved.skills[deploy].skillbom.embeddingHash must not be empty",
 		},
 		{
+			name: "empty policy ref",
+			lf: Lockfile{
+				Version:     2,
+				GeneratedAt: now,
+				GeneratedBy: "ac/0.1.0",
+				Resolved: ResolvedArtifacts{
+					Policy: &ResolvedPolicy{
+						Ref:        "",
+						Digest:     "sha256:policy01",
+						Epoch:      1,
+						ExpiresAt:  expiresAt,
+						ResolvedAt: now,
+					},
+				},
+			},
+			wantErr: "resolved.policy.ref must not be empty",
+		},
+		{
+			name: "invalid policy digest",
+			lf: Lockfile{
+				Version:     2,
+				GeneratedAt: now,
+				GeneratedBy: "ac/0.1.0",
+				Resolved: ResolvedArtifacts{
+					Policy: &ResolvedPolicy{
+						Ref:        "ghcr.io/acme/org-policy:stable",
+						Digest:     "nocolon",
+						Epoch:      1,
+						ExpiresAt:  expiresAt,
+						ResolvedAt: now,
+					},
+				},
+			},
+			wantErr: "resolved.policy.digest: must be in algorithm:hex format",
+		},
+		{
+			name: "invalid policy epoch",
+			lf: Lockfile{
+				Version:     2,
+				GeneratedAt: now,
+				GeneratedBy: "ac/0.1.0",
+				Resolved: ResolvedArtifacts{
+					Policy: &ResolvedPolicy{
+						Ref:        "ghcr.io/acme/org-policy:stable",
+						Digest:     "sha256:policy01",
+						Epoch:      0,
+						ExpiresAt:  expiresAt,
+						ResolvedAt: now,
+					},
+				},
+			},
+			wantErr: "resolved.policy.epoch must be greater than 0",
+		},
+		{
+			name: "zero policy expiresAt",
+			lf: Lockfile{
+				Version:     2,
+				GeneratedAt: now,
+				GeneratedBy: "ac/0.1.0",
+				Resolved: ResolvedArtifacts{
+					Policy: &ResolvedPolicy{
+						Ref:        "ghcr.io/acme/org-policy:stable",
+						Digest:     "sha256:policy01",
+						Epoch:      1,
+						ResolvedAt: now,
+					},
+				},
+			},
+			wantErr: "resolved.policy.expiresAt must not be zero",
+		},
+		{
+			name: "zero policy resolvedAt",
+			lf: Lockfile{
+				Version:     2,
+				GeneratedAt: now,
+				GeneratedBy: "ac/0.1.0",
+				Resolved: ResolvedArtifacts{
+					Policy: &ResolvedPolicy{
+						Ref:       "ghcr.io/acme/org-policy:stable",
+						Digest:    "sha256:policy01",
+						Epoch:     1,
+						ExpiresAt: expiresAt,
+					},
+				},
+			},
+			wantErr: "resolved.policy.resolvedAt must not be zero",
+		},
+		{
 			name: "nil image is valid",
 			lf: Lockfile{
 				Version:     2,
@@ -316,6 +417,7 @@ func TestLockfile_Validate_MultipleErrors(t *testing.T) {
 
 func TestLockfile_RoundTrip(t *testing.T) {
 	now := time.Date(2026, 1, 28, 0, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(24 * time.Hour)
 
 	original := &Lockfile{
 		Version:     2,
@@ -362,6 +464,18 @@ func TestLockfile_RoundTrip(t *testing.T) {
 						EmbeddingHash: "sha256:embed01",
 						Capabilities:  []string{"filesystem.read", "git.diff"},
 					},
+				},
+			},
+			Policy: &ResolvedPolicy{
+				Ref:        "ghcr.io/acme/org-policy:stable",
+				Digest:     "sha256:policy01",
+				Epoch:      7,
+				ExpiresAt:  expiresAt,
+				ResolvedAt: now,
+				Signature: &SignatureRef{
+					KeylessRef: "https://rekor.sigstore.dev/api/v1/log/entries/policy",
+					Issuer:     "https://token.actions.githubusercontent.com",
+					Subject:    "https://github.com/acme/org-policy/.github/workflows/release.yml@refs/tags/v7",
 				},
 			},
 		},
@@ -427,6 +541,27 @@ func TestLockfile_RoundTrip(t *testing.T) {
 		}
 	} else {
 		t.Error("Skills[code-review] not found in round-tripped lockfile")
+	}
+	if roundTripped.Resolved.Policy == nil {
+		t.Fatal("Resolved.Policy is nil, want non-nil")
+	}
+	if roundTripped.Resolved.Policy.Ref != original.Resolved.Policy.Ref {
+		t.Errorf("Policy.Ref = %q, want %q", roundTripped.Resolved.Policy.Ref, original.Resolved.Policy.Ref)
+	}
+	if roundTripped.Resolved.Policy.Digest != original.Resolved.Policy.Digest {
+		t.Errorf("Policy.Digest = %q, want %q", roundTripped.Resolved.Policy.Digest, original.Resolved.Policy.Digest)
+	}
+	if roundTripped.Resolved.Policy.Epoch != original.Resolved.Policy.Epoch {
+		t.Errorf("Policy.Epoch = %d, want %d", roundTripped.Resolved.Policy.Epoch, original.Resolved.Policy.Epoch)
+	}
+	if !roundTripped.Resolved.Policy.ExpiresAt.Equal(original.Resolved.Policy.ExpiresAt) {
+		t.Errorf("Policy.ExpiresAt = %v, want %v", roundTripped.Resolved.Policy.ExpiresAt, original.Resolved.Policy.ExpiresAt)
+	}
+	if !roundTripped.Resolved.Policy.ResolvedAt.Equal(original.Resolved.Policy.ResolvedAt) {
+		t.Errorf("Policy.ResolvedAt = %v, want %v", roundTripped.Resolved.Policy.ResolvedAt, original.Resolved.Policy.ResolvedAt)
+	}
+	if roundTripped.Resolved.Policy.Signature == nil {
+		t.Error("Policy.Signature is nil, want non-nil")
 	}
 }
 

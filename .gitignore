@@ -39,5 +39,8 @@ docs/node_modules/
 # Claude Code local settings (user-specific, not committed)
 .claude/settings.local.json
 
+# Local MCP client/server configuration
+.mcp.json
+
 # Git worktrees
 .worktrees/

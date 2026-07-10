@@ -9,14 +9,18 @@ on:
       - 'internal/cli/exec.go'
       - 'internal/cli/build.go'
       - 'internal/cli/policy.go'
-      - 'internal/container/docker.go'
-      - 'internal/container/runtime.go'
+      - 'internal/cli/policy_channel.go'
+      - 'internal/container/**'
+      - 'internal/adversarial/**'
       - 'internal/orgpolicy/extract.go'
       - 'internal/oci/fetch.go'
       - 'internal/oci/push.go'
       - 'internal/enforcement/grpc.go'
+      - 'internal/sidecar/**'
       - 'internal/secrets/**'
+      - 'test/adversarial/**'
       - 'test/integration/**'
+      - '.mise.toml'
   pull_request:
     paths:
       - 'enforcer/**'
@@ -24,14 +28,18 @@ on:
       - 'internal/cli/exec.go'
       - 'internal/cli/build.go'
       - 'internal/cli/policy.go'
-      - 'internal/container/docker.go'
-      - 'internal/container/runtime.go'
+      - 'internal/cli/policy_channel.go'
+      - 'internal/container/**'
+      - 'internal/adversarial/**'
       - 'internal/orgpolicy/extract.go'
       - 'internal/oci/fetch.go'
       - 'internal/oci/push.go'
       - 'internal/enforcement/grpc.go'
+      - 'internal/sidecar/**'
       - 'internal/secrets/**'
+      - 'test/adversarial/**'
       - 'test/integration/**'
+      - '.mise.toml'
   workflow_dispatch:
 
 concurrency:
@@ -57,6 +65,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -79,4 +91,9 @@ jobs:
         run: docker build -t ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer:latest enforcer/
 
       - name: Run integration tests
-        run: go test -race -tags=integration ./internal/integration/...
+        run: mise run test:integration
+
+      - name: Run adversarial dogfood tests
+        env:
+          AC_ADVERSARIAL_ENFORCER_IMAGE: ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer:latest
+        run: mise run test:dogfood

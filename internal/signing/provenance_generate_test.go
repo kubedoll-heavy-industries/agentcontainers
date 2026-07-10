@@ -376,7 +376,7 @@ func TestGenerateInTotoStatementRoundTrip(t *testing.T) {
 		t.Fatalf("NewProvenanceFromGitHub() error: %v", err)
 	}
 
-	stmt, err := GenerateInTotoStatement(prov, "ghcr.io/khi/ac", map[string]string{"sha256": "abc123"})
+	stmt, err := GenerateInTotoStatement(prov, "ghcr.io/khi/agentcontainer", map[string]string{"sha256": "abc123"})
 	if err != nil {
 		t.Fatalf("GenerateInTotoStatement() error: %v", err)
 	}

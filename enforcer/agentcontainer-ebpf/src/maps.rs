@@ -10,7 +10,8 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    CgroupStats, FsInodeKey, PortKeyV4, SecretAclKey, SecretAclValue,
+    CgroupStats, DenySetKey, KernelOffsets, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4,
+    ScopedLpmKeyV6, ScopedPortKeyV4, SecretAclKey, SecretAclValue,
 };
 use agentcontainer_common::siphash::SipHashKey;
 
@@ -21,18 +22,67 @@ use agentcontainer_common::siphash::SipHashKey;
 #[map]
 pub static ENFORCED_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
+/// Ancestor-walk depth bound. The kernel cgroup tree is shallow in practice; the
+/// bound keeps the walk verifier-friendly.
+pub const MAX_CGROUP_DEPTH: i32 = 16;
+
+/// The enforced cgroup (id + its policy flags) governing the current task: its
+/// own cgroup if directly registered, otherwise the nearest ancestor present in
+/// `ENFORCED_CGROUPS` (SUBTREE match). Returning the registered ancestor means a
+/// task moved into a descendant cgroup — `mkdir <enforced>/x; echo $$ >
+/// x/cgroup.procs`, the Escape-the-Box T11 vector — stays governed by that
+/// ancestor's policy/stats/inode maps instead of escaping enforcement. `None`
+/// when neither the task nor any ancestor is enforced.
+///
+/// Perf: the fast path is one lookup for a directly-registered cgroup (the
+/// normal container case). Only tasks NOT directly enforced pay the bounded
+/// ancestor walk — including unenforced host processes on the system-wide LSM
+/// hooks.
+#[inline(always)]
+pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
+    let cgid = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    if let Some(&flags) = unsafe { ENFORCED_CGROUPS.get(&cgid) } {
+        return Some((cgid, flags));
+    }
+    // Subtree walk: root (level 0) → self. `bpf_get_current_ancestor_cgroup_id`
+    // returns 0 past the task's own depth, so break there.
+    for level in 0..MAX_CGROUP_DEPTH {
+        let id = unsafe { aya_ebpf::helpers::gen::bpf_get_current_ancestor_cgroup_id(level) };
+        if id == 0 {
+            break;
+        }
+        if let Some(&flags) = unsafe { ENFORCED_CGROUPS.get(&id) } {
+            return Some((id, flags));
+        }
+    }
+    None
+}
+
+/// Id-only [`enforced_cgroup_flags_for_current`] for callers that don't read the
+/// per-cgroup policy flags (the egress, bind, process, and file hooks).
+#[inline(always)]
+pub fn enforced_cgroup_for_current() -> Option<u64> {
+    enforced_cgroup_flags_for_current().map(|(id, _)| id)
+}
+
+// --- Kernel field offsets (CO-RE substitute) ---
+
+/// Single-entry array: BTF-resolved kernel struct field offsets for LSM hooks.
+/// Userspace populates index 0 before attach; hooks fail-closed if absent.
+#[map]
+pub static KERNEL_OFFSETS: Array<KernelOffsets> = Array::with_max_entries(1, 0);
+
 // --- Network maps ---
 
-/// IPv4 CIDRs that are permitted (LPM trie longest prefix match).
-/// Key type is `u32` (network-byte-order IPv4 address). The prefix length
-/// is supplied via `Key::new(prefix_len, addr)` at lookup/insert time.
+/// Per-cgroup IPv4 CIDRs that are permitted (LPM trie longest prefix match).
+/// Prefix length includes the 64-bit cgroup ID plus IPv4 prefix bits.
 #[map]
-pub static ALLOWED_V4: LpmTrie<u32, u8> = LpmTrie::with_max_entries(4096, 0);
+pub static ALLOWED_V4: LpmTrie<ScopedLpmKeyV4, u8> = LpmTrie::with_max_entries(4096, 0);
 
-/// IPv6 CIDRs that are permitted.
-/// Key type is `[u32; 4]` (four 32-bit words of IPv6 address in network order).
+/// Per-cgroup IPv6 CIDRs that are permitted.
+/// Prefix length includes the 64-bit cgroup ID plus IPv6 prefix bits.
 #[map]
-pub static ALLOWED_V6: LpmTrie<[u32; 4], u8> = LpmTrie::with_max_entries(4096, 0);
+pub static ALLOWED_V6: LpmTrie<ScopedLpmKeyV6, u8> = LpmTrie::with_max_entries(4096, 0);
 
 /// IPv4 CIDRs that are always denied (e.g., cloud metadata endpoints).
 /// Checked BEFORE the allow lists.
@@ -43,10 +93,10 @@ pub static BLOCKED_CIDRS_V4: LpmTrie<u32, u8> = LpmTrie::with_max_entries(256, 0
 #[map]
 pub static BLOCKED_CIDRS_V6: LpmTrie<[u32; 4], u8> = LpmTrie::with_max_entries(256, 0);
 
-/// IPv4 IP+port+protocol tuples that are explicitly permitted.
+/// Per-cgroup IPv4 IP+port+protocol tuples that are explicitly permitted.
 /// Checked after blocked CIDRs but before broad allowed CIDRs.
 #[map]
-pub static ALLOWED_PORTS: HashMap<PortKeyV4, u8> = HashMap::with_max_entries(1024, 0);
+pub static ALLOWED_PORTS: HashMap<ScopedPortKeyV4, u8> = HashMap::with_max_entries(1024, 0);
 
 /// Ring buffer for network enforcement events.
 #[map]
@@ -80,11 +130,11 @@ pub static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 /// Allowed inodes with permission bits (read/write).
 #[map]
-pub static ALLOWED_INODES: HashMap<FsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
+pub static ALLOWED_INODES: HashMap<ScopedFsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Denied inodes (always blocked).
 #[map]
-pub static DENIED_INODES: HashMap<FsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
+pub static DENIED_INODES: HashMap<ScopedFsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Ring buffer for filesystem enforcement events.
 #[map]
@@ -97,9 +147,9 @@ pub static FS_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 // --- Process maps ---
 
 /// Allowed executable inodes (binary allowlist).
-/// Uses FsInodeKey since exec inodes have the same layout.
+/// Uses ScopedFsInodeKey since exec inodes have the same layout.
 #[map]
-pub static ALLOWED_EXECS: HashMap<FsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
+pub static ALLOWED_EXECS: HashMap<ScopedFsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Ring buffer for process enforcement events.
 #[map]
@@ -124,6 +174,46 @@ pub static CRED_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 #[map]
 pub static CRED_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 
+// --- Process deny-set maps ---
+
+/// Per-process deny-set membership (pid → deny_set_id).
+#[map]
+pub static PROC_DENY_SETS: HashMap<u32, u32> = HashMap::with_max_entries(8192, 0);
+
+/// Deny-set policy: (deny_set_id, inode, dev) → blocked.
+#[map]
+pub static DENY_SET_POLICY: HashMap<DenySetKey, u8> = HashMap::with_max_entries(16384, 0);
+
+/// Deny-set transitions: (deny_set_id, inode, dev) → new deny_set_id.
+#[map]
+pub static DENY_SET_TRANSITIONS: HashMap<DenySetKey, u32> = HashMap::with_max_entries(4096, 0);
+
+// --- Bind maps ---
+
+/// Allowed bind ports (port + protocol).
+#[map]
+pub static ALLOWED_BINDS: HashMap<ScopedBindKey, u8> = HashMap::with_max_entries(256, 0);
+
+/// Ring buffer for bind enforcement events.
+#[map]
+pub static BIND_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// --- Reverse shell detection ---
+
+/// Mode flag for reverse shell detection (index 0: 0=disabled, 1=enabled).
+#[map]
+pub static REVERSE_SHELL_MODE: Array<u8> = Array::with_max_entries(1, 0);
+
+/// Ring buffer for reverse shell detection events.
+#[map]
+pub static REVERSE_SHELL_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// --- Memfd blocking ---
+
+/// Ring buffer for memfd blocking events.
+#[map]
+pub static MEMFD_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
 // --- Per-cgroup statistics ---
 
 /// Per-cgroup enforcement statistics (per-CPU hash map keyed by cgroup_id).
@@ -143,6 +233,10 @@ pub const CGROUP_STAT_PROC_ALLOWED: usize = 4;
 pub const CGROUP_STAT_PROC_BLOCKED: usize = 5;
 pub const CGROUP_STAT_CRED_ALLOWED: usize = 6;
 pub const CGROUP_STAT_CRED_BLOCKED: usize = 7;
+pub const CGROUP_STAT_BIND_ALLOWED: usize = 8;
+pub const CGROUP_STAT_BIND_BLOCKED: usize = 9;
+pub const CGROUP_STAT_DENYSET_ALLOWED: usize = 10;
+pub const CGROUP_STAT_DENYSET_BLOCKED: usize = 11;
 
 /// Increment a specific counter in the per-cgroup stats map for the given cgroup_id.
 ///
@@ -167,6 +261,10 @@ pub fn bump_cgroup_stat(cgroup_id: u64, field_offset: usize) {
                 process_blocked: 0,
                 credential_allowed: 0,
                 credential_blocked: 0,
+                bind_allowed: 0,
+                bind_blocked: 0,
+                denyset_allowed: 0,
+                denyset_blocked: 0,
             };
             let base = &mut stats as *mut CgroupStats as *mut u8;
             let counter = base.add(field_offset * 8) as *mut u64;

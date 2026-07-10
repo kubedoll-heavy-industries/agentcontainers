@@ -22,6 +22,27 @@ description = "Run unit tests"
 run = "go test -race -tags=integration ./internal/integration/..."
 description = "Run integration tests"
 
+[tasks."test:adversarial"]
+run = "env GOCACHE=${GOCACHE:-/tmp/go-build} go test ./internal/adversarial"
+description = "Run unit-level adversarial dogfood harness tests"
+
+[tasks."test:adversarial:integration"]
+run = "env GOCACHE=${GOCACHE:-/tmp/go-build} go test -race -tags=integration -run TestAdversarial -count=1 ./internal/integration"
+description = "Run Docker-backed adversarial dogfood scenarios"
+
+[tasks."test:integration:ts"]
+run = "npm ci --prefix test/integration && env AC_ENFORCER_IMAGE=${AC_ENFORCER_IMAGE:-agentcontainer-enforcer:verify} npm test --prefix test/integration"
+description = "Run TypeScript testcontainers integration tests"
+
+[tasks."test:dogfood"]
+depends = ["test:adversarial", "test:adversarial:integration"]
+description = "Run adversarial dogfood harnesses"
+
+[tasks."redteam:codex"]
+depends = ["build"]
+run = "env GOCACHE=${GOCACHE:-/tmp/go-build} go run ./cmd/agentcontainer-redteam-codex"
+description = "Create a disposable locked-down container for Codex escape testing"
+
 [tasks."test:all"]
 depends = ["test", "test:integration"]
 description = "Run all tests"

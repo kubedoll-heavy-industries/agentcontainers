@@ -18,6 +18,16 @@ service Enforcer {
   rpc ApplyCredentialPolicy(CredentialPolicyRequest) returns (PolicyResponse);
   rpc InjectSecrets(InjectSecretsRequest) returns (InjectSecretsResponse);
 
+  // Deny-set process-tree policy.
+  rpc ApplyDenySetPolicy(ApplyDenySetPolicyRequest) returns (PolicyResponse);
+  rpc UpdateDenySetPolicy(UpdateDenySetPolicyRequest) returns (PolicyResponse);
+
+  // Bind (listen) policy.
+  rpc ApplyBindPolicy(BindPolicyRequest) returns (PolicyResponse);
+
+  // Reverse shell detection configuration.
+  rpc ConfigureReverseShellDetection(ReverseShellConfigRequest) returns (PolicyResponse);
+
   // Policy bundle — content trust for ACL re-derivation.
   // Must be called before ApplyCredentialPolicy.  The enforcer stores a hash
   // of the policy JSON so that subsequent ApplyCredentialPolicy calls can be
@@ -85,6 +95,52 @@ message FilesystemPolicyRequest {
 message ProcessPolicyRequest {
   string container_id = 1;
   repeated string allowed_binaries = 2;
+}
+
+// --- Deny-set process-tree policy ---
+
+message DenySetEntry {
+  uint32 deny_set_id = 1;
+  string binary_path = 2;
+}
+
+message DenySetTransition {
+  uint32 parent_deny_set_id = 1;
+  string child_binary_path = 2;
+  uint32 child_deny_set_id = 3;
+}
+
+message ApplyDenySetPolicyRequest {
+  string container_id = 1;
+  repeated DenySetEntry allowed_entries = 2;
+  repeated DenySetTransition transitions = 3;
+  uint32 init_pid = 4;
+  uint32 init_deny_set_id = 5;
+}
+
+message UpdateDenySetPolicyRequest {
+  string container_id = 1;
+  uint32 deny_set_id = 2;
+  string binary_path = 3;
+}
+
+// --- Bind (listen) policy ---
+
+message BindPolicyRequest {
+  string container_id = 1;
+  repeated BindRule allowed_binds = 2;
+}
+
+message BindRule {
+  uint32 port = 1;
+  string protocol = 2;
+}
+
+// --- Reverse shell detection ---
+
+message ReverseShellConfigRequest {
+  string container_id = 1;
+  string mode = 2;
 }
 
 // --- Credential policy ---

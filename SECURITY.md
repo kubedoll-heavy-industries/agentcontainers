@@ -88,7 +88,7 @@ These are pre-alpha implementation gaps, not design flaws. They are documented s
 
 ### F8: Secret ACL re-derivation is a stub
 
-The enforcer accepts `LoadPolicyBundle` and stores a SipHash-2-4 128-bit digest of the policy bundle, but does not re-derive `SECRET_ACLS` from the signed policy on the Rust side. The Go `ac` binary installs ACLs directly. A compromised `ac` binary can install permissive ACLs as long as it provides a matching hash. Full Rust-side re-derivation of `SECRET_ACLS` from the signed org policy is planned; until then the enforcer trusts the caller's ACL table.
+The enforcer accepts `LoadPolicyBundle` and stores a SipHash-2-4 128-bit digest of the policy bundle, but does not re-derive `SECRET_ACLS` from the signed policy on the Rust side. The Go `agentcontainer` binary installs ACLs directly. A compromised `agentcontainer` binary can install permissive ACLs as long as it provides a matching hash. Full Rust-side re-derivation of `SECRET_ACLS` from the signed org policy is planned; until then the enforcer trusts the caller's ACL table.
 
 ### CREDLSM coverage gaps
 

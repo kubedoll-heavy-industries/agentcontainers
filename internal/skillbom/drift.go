@@ -12,7 +12,7 @@ const (
 	DriftBreaking DriftClassification = "breaking"
 )
 
-// DefaultThresholds are the PRD-008 default drift thresholds.
+// DefaultThresholds are the default semantic drift classification boundaries.
 var DefaultThresholds = DriftThresholds{
 	Patch:    0.05,
 	Minor:    0.15,

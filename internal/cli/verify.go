@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -146,10 +147,11 @@ type verifyResult struct {
 	sigInvalid  []string // artifacts with invalid/missing signatures
 	provValid   []string // artifacts with valid provenance
 	provInvalid []string // artifacts with invalid/missing provenance
+	policyFail  []string // artifacts denied by mutable policy channel
 }
 
 func (vr *verifyResult) total() int {
-	return len(vr.missing) + len(vr.stale) + len(vr.errors) + len(vr.sigInvalid) + len(vr.provInvalid)
+	return len(vr.missing) + len(vr.stale) + len(vr.errors) + len(vr.sigInvalid) + len(vr.provInvalid) + len(vr.policyFail)
 }
 
 // bundleFetcher abstracts fetching Sigstore bundles for testability.
@@ -237,10 +239,17 @@ func runVerifyFull(cmd *cobra.Command, configPath, lockfilePath string, strict, 
 		}
 	}
 
+	policyRef := configuredPolicyRef(cfg)
+	if policyRef != "" && lf.Resolved.Policy == nil {
+		result.missing = append(result.missing, fmt.Sprintf("policy %s: not pinned in lockfile", policyRef))
+	}
+	verifyLockedPolicyChannel(policyRef, lf, time.Now().UTC(), &result)
+
 	// 5. Registry freshness check: compare lockfile digests against live registry.
 	if registry {
 		resolver := newOCIResolver()
 		verifyRegistryDigests(ctx, cfg, lf, resolver, &result)
+		verifyPolicyChannel(ctx, cfg, lf, resolver, policyRef, &result)
 	}
 
 	// 6. Signature verification (when --signatures is set).
@@ -307,17 +316,66 @@ func runVerifyFull(cmd *cobra.Command, configPath, lockfilePath string, strict, 
 	for _, w := range result.provInvalid {
 		_, _ = fmt.Fprintf(out, "PROV FAIL: %s\n", w)
 	}
+	for _, w := range result.policyFail {
+		_, _ = fmt.Fprintf(out, "POLICY FAIL: %s\n", w)
+	}
 	for _, w := range result.errors {
 		_, _ = fmt.Fprintf(out, "ERROR: %s\n", w)
 	}
 
 	if strict {
-		return fmt.Errorf("verify: %d issue(s) found (%d missing, %d stale, %d sig-fail, %d prov-fail, %d errors)",
-			result.total(), len(result.missing), len(result.stale), len(result.sigInvalid), len(result.provInvalid), len(result.errors))
+		return fmt.Errorf("verify: %d issue(s) found (%d missing, %d stale, %d sig-fail, %d prov-fail, %d policy-fail, %d errors)",
+			result.total(), len(result.missing), len(result.stale), len(result.sigInvalid), len(result.provInvalid), len(result.policyFail), len(result.errors))
 	}
 
 	_, _ = fmt.Fprintf(out, "\nVerification completed with %d issue(s).\n", result.total())
 	return nil
+}
+
+func verifyPolicyChannel(ctx context.Context, cfg *config.AgentContainer, lf *config.Lockfile, fetcher policyBundleFetcher, policyRef string, result *verifyResult) {
+	if policyRef == "" || lf.Resolved.Policy == nil {
+		return
+	}
+
+	now := time.Now().UTC()
+	currentPolicy, bundle, err := resolvePolicyChannel(ctx, fetcher, policyRef, now)
+	if err != nil {
+		result.errors = append(result.errors, fmt.Sprintf("policy %s: %v", policyRef, err))
+		return
+	}
+	if currentPolicy.Digest != lf.Resolved.Policy.Digest {
+		result.stale = append(result.stale,
+			fmt.Sprintf("policy %s: lockfile has %s, registry has %s",
+				policyRef, lf.Resolved.Policy.Digest, currentPolicy.Digest))
+	}
+	if err := checkPolicyReplacement(lf.Resolved.Policy, currentPolicy); err != nil {
+		result.errors = append(result.errors, fmt.Sprintf("policy %s: %v", policyRef, err))
+		return
+	}
+	if _, err := verifyPolicyChannelSignature(ctx, policyRef, currentPolicy.Digest, signing.VerifyOptions{}); err != nil {
+		result.sigInvalid = append(result.sigInvalid, fmt.Sprintf("policy %s: %v", policyRef, err))
+	}
+	for _, issue := range evaluatePolicyChannelArtifacts(cfg, lf, bundle, now) {
+		result.policyFail = append(result.policyFail, fmt.Sprintf("%s: %v", issue.label, issue.err))
+	}
+}
+
+func verifyLockedPolicyChannel(policyRef string, lf *config.Lockfile, now time.Time, result *verifyResult) {
+	if policyRef == "" || lf == nil || lf.Resolved.Policy == nil {
+		return
+	}
+	if lf.Resolved.Policy.ExpiresAt.IsZero() {
+		result.policyFail = append(result.policyFail, fmt.Sprintf("policy %s: locked policy expiresAt is missing", policyRef))
+		return
+	}
+	if !lf.Resolved.Policy.ExpiresAt.After(now) {
+		result.policyFail = append(result.policyFail,
+			fmt.Sprintf("policy %s: locked policy is expired: expiresAt %s is not after %s",
+				policyRef, lf.Resolved.Policy.ExpiresAt.Format(time.RFC3339), now.Format(time.RFC3339)))
+	}
+	if lf.Resolved.Policy.Signature == nil {
+		result.sigInvalid = append(result.sigInvalid, fmt.Sprintf("policy %s: locked policy signature is missing", policyRef))
+	}
 }
 
 // verifyProvenance checks SLSA provenance attestations for all OCI artifacts

@@ -2,7 +2,9 @@ package enforcement
 
 import (
 	"context"
+	"net"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -56,7 +58,13 @@ func ProbeEnforcerHealth(target string) bool {
 func probeEnforcerHealth(target string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if socketPath, ok := strings.CutPrefix(target, "unix://"); ok {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}))
+	}
+	conn, err := grpc.NewClient(target, dialOpts...)
 	if err != nil {
 		return false
 	}

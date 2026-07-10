@@ -15,6 +15,15 @@ description: All agentcontainer commands and their usage.
 | `agentcontainer ps` | List running agent containers |
 | `agentcontainer logs <name>` | View container logs |
 | `agentcontainer gc` | Garbage collect stopped containers and dangling images |
+| `agentcontainer dojo [profile]` | Start a disposable adversarial harness and drop into chat |
+
+Available dojo profiles:
+
+| Profile | Focus |
+|---|---|
+| `codex-redteam` | Default canary-backed escape-test prompt |
+| `procfs-runc` | Procfs, sysfs, cgroup, mount metadata, and runtime setup confusion sweep |
+| `runtime-sockets` | Docker/containerd/CRI-O/Podman sockets, Kubernetes tokens, cloud metadata, and env exposure |
 
 ## Supply chain commands
 

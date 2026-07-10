@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,7 +39,7 @@ const (
 	// LabelComponent identifies the container as an enforcer component.
 	LabelComponent = "dev.agentcontainer/component"
 
-	// LabelManaged indicates the container was started by ac (not pre-existing).
+	// LabelManaged indicates the container was started by agentcontainer (not pre-existing).
 	LabelManaged = "dev.agentcontainer/managed"
 )
 
@@ -50,9 +51,12 @@ type SidecarHandle struct {
 	// Addr is the gRPC endpoint address (e.g., "127.0.0.1:50051").
 	Addr string
 
-	// Managed is true if this sidecar was started by ac (not pre-existing).
+	// Managed is true if this sidecar was started by agentcontainer (not pre-existing).
 	// Only managed sidecars are stopped during teardown.
 	Managed bool
+
+	// SocketPath is the host Unix socket path for UDS sidecars.
+	SocketPath string
 }
 
 // StartOptions configures sidecar startup behavior.
@@ -61,8 +65,20 @@ type StartOptions struct {
 	// Default: DefaultEnforcerImage
 	Image string
 
-	// Port is the host TCP port to bind (default: 50051).
+	// Port is the container gRPC listen port (default: 50051).
+	// If HostPort is unset, this is also used as the host-published port for
+	// compatibility with earlier releases.
 	Port int
+
+	// HostPort is the host TCP port to publish. If unset, defaults to Port.
+	HostPort int
+
+	// RandomHostPort publishes Port to an ephemeral Docker-assigned host port.
+	RandomHostPort bool
+
+	// SocketPath is a host Unix socket path for gRPC. When set, the sidecar
+	// bind-mounts its parent directory and does not publish a TCP port.
+	SocketPath string
 
 	// HealthTimeout is how long to wait for SERVING (default: 15s).
 	HealthTimeout time.Duration
@@ -87,6 +103,9 @@ func (o *StartOptions) applyDefaults() {
 	}
 	if o.Port == 0 {
 		o.Port = DefaultPort
+	}
+	if o.HostPort == 0 && !o.RandomHostPort {
+		o.HostPort = o.Port
 	}
 	if o.HealthTimeout == 0 {
 		o.HealthTimeout = DefaultHealthTimeout
@@ -138,8 +157,39 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 	}
 
 	// 2. Create the container.
-	portStr := fmt.Sprintf("%d", opts.Port)
-	exposedPort := network.MustParsePort(portStr + "/tcp")
+	containerPortStr := fmt.Sprintf("%d", opts.Port)
+	hostPortStr := fmt.Sprintf("%d", opts.HostPort)
+	if opts.RandomHostPort {
+		hostPortStr = ""
+	}
+	exposedPort := network.MustParsePort(containerPortStr + "/tcp")
+	socketPath := opts.SocketPath
+	socketDir := ""
+	containerSocketPath := ""
+	if socketPath != "" {
+		var err error
+		socketPath, err = filepath.Abs(socketPath)
+		if err != nil {
+			if opts.Required {
+				return nil, fmt.Errorf("resolving socket path: %w", err)
+			}
+			return nil, nil
+		}
+		socketDir = filepath.Dir(socketPath)
+		if err := os.MkdirAll(socketDir, 0700); err != nil {
+			if opts.Required {
+				return nil, fmt.Errorf("creating socket directory %s: %w", socketDir, err)
+			}
+			return nil, nil
+		}
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			if opts.Required {
+				return nil, fmt.Errorf("removing stale socket %s: %w", socketPath, err)
+			}
+			return nil, nil
+		}
+		containerSocketPath = "/run/agentcontainer-enforcer/" + filepath.Base(socketPath)
+	}
 
 	containerCfg := &container.Config{
 		Image: opts.Image,
@@ -151,12 +201,19 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 			LabelManaged:   "true",
 		},
 	}
+	if socketPath != "" {
+		containerCfg.Cmd = []string{
+			"--listen", "127.0.0.1:" + containerPortStr,
+			"--socket", containerSocketPath,
+		}
+	}
 
 	hostCfg := &container.HostConfig{
 		CapAdd: []string{
 			"BPF",
 			"NET_ADMIN",
 			"SYS_ADMIN",
+			"SYS_PTRACE",
 			"SYS_RESOURCE",
 		},
 		PidMode: container.PidMode("host"),
@@ -172,17 +229,23 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 				Source: "/sys/fs/bpf",
 				Target: "/sys/fs/bpf",
 			},
-			// UDS mount deferred to Phase 6 (PRD-015 non-goal).
-			// {Type: mount.TypeBind, Source: "/run/agentcontainer-enforcer", Target: "/run/agentcontainer-enforcer"},
-		},
-		PortBindings: network.PortMap{
-			exposedPort: {
-				{HostPort: portStr},
-			},
 		},
 		RestartPolicy: container.RestartPolicy{
 			Name: container.RestartPolicyUnlessStopped,
 		},
+	}
+	if socketPath == "" {
+		hostCfg.PortBindings = network.PortMap{
+			exposedPort: {
+				{HostPort: hostPortStr},
+			},
+		}
+	} else {
+		hostCfg.Mounts = append(hostCfg.Mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: socketDir,
+			Target: "/run/agentcontainer-enforcer",
+		})
 	}
 
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -195,9 +258,12 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		// (e.g., from a previous crash or concurrent agentcontainer run). Try to adopt it.
 		if isNameConflict(err) {
 			addr := fmt.Sprintf("127.0.0.1:%d", opts.Port)
-			if defaultHealthProber(addr) {
+			if socketPath != "" {
+				addr = "unix://" + socketPath
+			}
+			if !opts.RandomHostPort && defaultHealthProber(addr) {
 				// Existing container is healthy — adopt it as unmanaged.
-				return &SidecarHandle{Addr: addr, Managed: false}, nil
+				return &SidecarHandle{Addr: addr, Managed: false, SocketPath: socketPath}, nil
 			}
 			// Existing container is unhealthy — remove it and retry once.
 			_ = removeByName(ctx, dockerClient, ContainerName)
@@ -225,6 +291,7 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 	if _, err := dockerClient.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		// Best-effort cleanup on start failure.
 		_, _ = dockerClient.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+		cleanupSocket(socketPath)
 		if opts.Required {
 			return nil, fmt.Errorf("starting container: %w", err)
 		}
@@ -234,11 +301,26 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 	// 4. Wait for health check.
 	addr := opts.HealthCheckAddr
 	if addr == "" {
-		addr = fmt.Sprintf("127.0.0.1:%d", opts.Port)
+		if socketPath != "" {
+			addr = "unix://" + socketPath
+		} else if opts.RandomHostPort {
+			publishedPort, err := publishedHostPort(ctx, dockerClient, resp.ID, exposedPort)
+			if err != nil {
+				cleanupContainer(ctx, dockerClient, resp.ID)
+				if opts.Required {
+					return nil, fmt.Errorf("resolving random host port: %w", err)
+				}
+				return nil, nil
+			}
+			addr = "127.0.0.1:" + publishedPort
+		} else {
+			addr = fmt.Sprintf("127.0.0.1:%d", opts.HostPort)
+		}
 	}
 	if err := WaitHealthy(ctx, addr, opts.HealthTimeout, opts.HealthInterval); err != nil {
 		// Health check failed — clean up the container.
 		cleanupContainer(ctx, dockerClient, resp.ID)
+		cleanupSocket(socketPath)
 		if opts.Required {
 			return nil, fmt.Errorf("enforcer failed to reach SERVING: %w", err)
 		}
@@ -249,7 +331,25 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		ContainerID: resp.ID,
 		Addr:        addr,
 		Managed:     true,
+		SocketPath:  socketPath,
 	}, nil
+}
+
+func publishedHostPort(ctx context.Context, dockerClient client.APIClient, containerID string, port network.Port) (string, error) {
+	result, err := dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("inspecting container %s: %w", containerID, err)
+	}
+	if result.Container.NetworkSettings == nil {
+		return "", fmt.Errorf("container %s has no network settings", containerID)
+	}
+	bindings := result.Container.NetworkSettings.Ports[port]
+	for _, binding := range bindings {
+		if binding.HostPort != "" {
+			return binding.HostPort, nil
+		}
+	}
+	return "", fmt.Errorf("container %s has no host port for %s", containerID, port)
 }
 
 // StopSidecar gracefully stops and removes the managed sidecar container.
@@ -275,7 +375,17 @@ func StopSidecar(ctx context.Context, dockerClient client.APIClient, handle *Sid
 		return fmt.Errorf("removing sidecar: %w", err)
 	}
 
+	if handle.SocketPath != "" {
+		cleanupSocket(handle.SocketPath)
+	}
+
 	return nil
+}
+
+func cleanupSocket(path string) {
+	if path != "" {
+		_ = os.Remove(path)
+	}
 }
 
 // WaitHealthy polls the gRPC health endpoint at target until the service

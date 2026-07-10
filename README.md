@@ -2,7 +2,7 @@
 
 **Immutable, reproducible, least-privilege runtime environments for AI agents.**
 
-`agentcontainers` extends the [devcontainer.json](https://containers.dev/) specification to add security policy, supply chain verification, and human-in-the-loop permission approval for persistent AI agents (Claude Code, Codex CLI, Copilot Workspace, and similar tools).
+`agentcontainers` accepts common [devcontainer.json](https://containers.dev/) fields and adds security policy, supply chain verification, and human-in-the-loop permission approval for persistent AI agents (Claude Code, Codex CLI, Copilot Workspace, and similar tools).
 
 > "AI agents are threatening to break the blood-brain barrier between the application layer and the OS layer."
 > — Meredith Whittaker, President of Signal, SXSW 2025
@@ -18,7 +18,7 @@ Persistent AI agents require broad, long-lived system permissions. They read and
 | Threat | Mechanism |
 |--------|-----------|
 | Unapproved binary execution | Default-deny approval broker + eBPF enforcer |
-| Argument injection / subshell escapes | Approval broker blocks known interpreter escape patterns (`-c`, `-e` flags) |
+| Argument injection / subshell escapes | Approval broker blocks known interpreter escape patterns; generated seccomp and eBPF sidecar layers add runtime checks |
 | File access outside declared paths | Read-only root FS, explicit bind mounts |
 | Network exfiltration | cgroup-scoped BPF connect4/sendmsg hooks |
 | Credential theft | Secrets injected via tmpfs at `/run/secrets`; never in env vars |
@@ -29,7 +29,7 @@ Persistent AI agents require broad, long-lived system permissions. They read and
 
 ## Status
 
-**Pre-Alpha.** M0–M4 are shipped; M5 (ecosystem) is in planning. The build and tests pass. The API and schema are not yet stable.
+**Pre-Alpha.** M0-M4 are mostly shipped; M5 alpha hardening is in progress. The build and tests pass. The API and schema are not yet stable.
 
 | Milestone | Status | What shipped |
 |-----------|--------|-------------|
@@ -38,7 +38,8 @@ Persistent AI agents require broad, long-lived system permissions. They read and
 | M2: Sandbox | Shipped | Docker Sandbox VM backend, in-VM enforcement, compose-in-sandbox, multi-arch enforcer image |
 | M3: Attest | Shipped | `agentcontainer sign`, Sigstore integration, SLSA provenance, drift threshold enforcement, offline verification |
 | M4: Enterprise | Mostly complete | Org policy as OCI layer, secrets (Vault/Infisical/1Password/OIDC), per-cgroup LSM credential enforcement |
-| M5: Ecosystem | Planning | VS Code extension, Firecracker backend, Linux K8s, MCP registry integration |
+| M5: Alpha Hardening | In progress | `agentcontainer dojo`, adversarial canary profiles, contemporary container escape regression sweeps |
+| M6: Ecosystem | Planning | VS Code extension, Firecracker backend, Linux K8s, MCP registry integration |
 
 ---
 
@@ -58,6 +59,8 @@ git clone https://github.com/Kubedoll-Heavy-Industries/agentcontainers
 cd agentcontainers
 mise install
 mise run build       # builds to tmp/agentcontainer
+mise run test        # runs the default Go test suite
+tmp/agentcontainer version
 ```
 
 Or install directly:
@@ -79,8 +82,8 @@ agentcontainer init
 ### Pin dependencies
 
 ```bash
-agentcontainer lock    # resolves all OCI references to digests and writes agentcontainer-lock.json
-agentcontainer verify  # verifies lockfile coverage and optionally checks signatures
+agentcontainer lock    # resolves OCI image, feature, MCP, and skill references to digests
+agentcontainer verify  # verifies lockfile coverage and optional signature/provenance checks
 ```
 
 ### Run an agent
@@ -94,7 +97,7 @@ agentcontainer exec -- claude   # executes inside the container with approval ga
 
 ## agentcontainer.json
 
-Any valid `devcontainer.json` is a valid `agentcontainer.json`. The `agent` key adds capabilities, policy, secrets, and provenance configuration:
+`agentcontainer.json` supports common devcontainer fields such as `image`, `build`, `features`, and `mounts`. Broader devcontainer compatibility is still alpha. The `agent` key adds capabilities, policy, secrets, and provenance configuration:
 
 ```jsonc
 {
@@ -102,25 +105,30 @@ Any valid `devcontainer.json` is a valid `agentcontainer.json`. The `agent` key 
   "agent": {
     "capabilities": {
       "network": {
-        "egress": {
-          "allowedDomains": ["api.github.com", "registry.npmjs.org"]
-        }
+        "egress": [
+          { "host": "api.github.com", "port": 443 },
+          { "host": "registry.npmjs.org", "port": 443 }
+        ]
       },
       "filesystem": {
-        "readOnlyPaths": ["/workspace"],
-        "writablePaths": ["/workspace/.cache"]
+        "read": ["/workspace/**"],
+        "write": ["/workspace/.cache/**"]
       },
-      "tools": {
-        "allowedBinaries": ["git", "npm", "node"],
-        "requireApproval": true
+      "shell": {
+        "commands": ["git", "npm", "node"]
       }
     },
     "policy": {
-      "source": "oci://ghcr.io/my-org/policy:latest"
+      "escalation": "prompt",
+      "auditLog": true
     },
     "secrets": {
-      "GITHUB_TOKEN": "vault://vault.corp/secret/github#token",
-      "NPM_TOKEN":    "op://Engineering/npm/token"
+      "GITHUB_TOKEN": {
+        "provider": "vault://secret/data/github#token"
+      },
+      "NPM_TOKEN": {
+        "provider": "op://Engineering/npm/token"
+      }
     }
   }
 }
@@ -159,7 +167,7 @@ Full schema reference: see the type definitions in [`internal/config/config.go`]
 └─────────────────────────────────────────────────────┘
 ```
 
-Enforcement is **fail-closed**: if the enforcer sidecar is unavailable, the container does not start.
+Enforcement is **fail-closed** for sidecar startup and policy-apply failures when the enforcer is required. In the current alpha, BPF policy is applied after the target cgroup exists, so a short startup window remains before policy application completes.
 
 For the security model and threat analysis: [SECURITY.md](./SECURITY.md)
 
@@ -167,9 +175,28 @@ For the security model and threat analysis: [SECURITY.md](./SECURITY.md)
 
 ## Development
 
+First-time contributor smoke check:
+
+```bash
+mise install
+mise run build
+mise run test
+tmp/agentcontainer version
+```
+
+That path does not require privileged eBPF loading or any cloud credentials.
+Docker-backed dogfood, TypeScript testcontainers, and Rust/eBPF checks are
+separate tiers.
+
 ```bash
 mise run build          # build binary to tmp/agentcontainer
 mise run test           # go test -race ./...
+mise run test:dogfood   # adversarial canary + Docker dogfood probes
+mise run test:integration:ts # TypeScript testcontainers integration suite
+mise run redteam:codex                # disposable locked-down manual escape-test container
+tmp/agentcontainer dojo               # start the default Codex red-team harness
+tmp/agentcontainer dojo procfs-runc   # focus on procfs/sysfs/cgroup runtime setup probes
+tmp/agentcontainer dojo runtime-sockets # focus on runtime sockets, K8s tokens, and metadata
 mise run test:cover     # tests with coverage report
 mise run lint           # golangci-lint
 mise run dev            # live reload with air
@@ -192,6 +219,11 @@ Repository layout:
 | `internal/orgpolicy/` | Org policy extraction, merge, comparison |
 | `internal/secrets/` | Secret provider implementations |
 | `enforcer/` | Rust: agentcontainer-ebpf (Aya BPF), agentcontainer-enforcer (Tokio gRPC) |
+
+Good first contribution areas are schema/config tests, policy translation
+tests, CLI command tests, dojo/adversarial profile fixtures, examples, and
+docs. Coordinate with maintainers before changing the Rust/eBPF enforcer,
+runtime interfaces, schema shape, signing, org-policy, or secrets behavior.
 
 ---
 

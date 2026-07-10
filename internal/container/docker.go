@@ -5,8 +5,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -15,6 +19,7 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
@@ -199,6 +204,11 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 		return nil, fmt.Errorf("docker runtime: inspecting container for init PID: %w", err)
 	}
 	initPID := uint32(inspectResult.Container.State.Pid)
+	if initPID == 0 {
+		_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
+		_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+		return nil, fmt.Errorf("docker runtime: inspecting container for init PID: container has no running init process")
+	}
 
 	// Post-start enforcement: register the container and apply policy via the
 	// enforcer sidecar. Must happen after ContainerStart because the cgroup is
@@ -319,6 +329,146 @@ func (d *DockerRuntime) Exec(ctx context.Context, session *Session, cmd []string
 		Stdout:   stdout.Bytes(),
 		Stderr:   stderr.Bytes(),
 	}, nil
+}
+
+// ExecInteractive executes a command inside the running container while
+// attaching local stdio. It is intended for shells and other interactive tools.
+func (d *DockerRuntime) ExecInteractive(ctx context.Context, session *Session, cmd []string, execIO ExecIO) (int, error) {
+	if session == nil {
+		return 0, fmt.Errorf("docker runtime: nil session")
+	}
+	if len(cmd) == 0 {
+		return 0, fmt.Errorf("docker runtime: empty command")
+	}
+	stdout := execIO.Stdout
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	stderr := execIO.Stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
+
+	execResp, err := d.client.ExecCreate(ctx, session.ContainerID, client.ExecCreateOptions{
+		Cmd:          cmd,
+		AttachStdin:  execIO.Stdin != nil,
+		AttachStdout: true,
+		AttachStderr: true,
+		TTY:          execIO.TTY,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: creating exec: %w", err)
+	}
+
+	attach, err := d.client.ExecAttach(ctx, execResp.ID, client.ExecAttachOptions{
+		TTY: execIO.TTY,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: attaching exec: %w", err)
+	}
+	defer attach.Close()
+
+	cleanupTTY, err := configureLocalTTY(ctx, d.client, execResp.ID, execIO)
+	if err != nil {
+		return 0, err
+	}
+	defer cleanupTTY()
+
+	if execIO.Stdin != nil {
+		go func() {
+			_, _ = io.Copy(attach.Conn, execIO.Stdin)
+			_ = attach.CloseWrite()
+		}()
+	}
+
+	if execIO.TTY {
+		if _, err := io.Copy(stdout, attach.Reader); err != nil {
+			return 0, fmt.Errorf("docker runtime: reading exec output: %w", err)
+		}
+	} else if _, err := stdcopy.StdCopy(stdout, stderr, attach.Reader); err != nil {
+		return 0, fmt.Errorf("docker runtime: reading exec output: %w", err)
+	}
+
+	inspect, err := d.client.ExecInspect(ctx, execResp.ID, client.ExecInspectOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: inspecting exec: %w", err)
+	}
+
+	return inspect.ExitCode, nil
+}
+
+func configureLocalTTY(ctx context.Context, cli client.APIClient, execID string, execIO ExecIO) (func(), error) {
+	if !execIO.TTY {
+		return func() {}, nil
+	}
+
+	var cleanupFuncs []func()
+
+	if stdin, ok := execIO.Stdin.(*os.File); ok && isTerminal(stdin) {
+		fd := int(stdin.Fd())
+		state, err := unix.IoctlGetTermios(fd, ioctlGetTermios)
+		if err != nil {
+			return nil, fmt.Errorf("docker runtime: reading local terminal state: %w", err)
+		}
+
+		raw := *state
+		raw.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+		raw.Oflag &^= unix.OPOST
+		raw.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+		raw.Cflag &^= unix.CSIZE | unix.PARENB
+		raw.Cflag |= unix.CS8
+		raw.Cc[unix.VMIN] = 1
+		raw.Cc[unix.VTIME] = 0
+
+		if err := unix.IoctlSetTermios(fd, ioctlSetTermios, &raw); err != nil {
+			return nil, fmt.Errorf("docker runtime: enabling local terminal raw mode: %w", err)
+		}
+		cleanupFuncs = append(cleanupFuncs, func() {
+			_ = unix.IoctlSetTermios(fd, ioctlSetTermios, state)
+		})
+	}
+
+	if stdout, ok := execIO.Stdout.(*os.File); ok && isTerminal(stdout) {
+		resize := func() {
+			if size, err := unix.IoctlGetWinsize(int(stdout.Fd()), unix.TIOCGWINSZ); err == nil && size.Col > 0 && size.Row > 0 {
+				_, _ = cli.ExecResize(ctx, execID, client.ExecResizeOptions{
+					Height: uint(size.Row),
+					Width:  uint(size.Col),
+				})
+			}
+		}
+		resize()
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGWINCH)
+		done := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-sigCh:
+					resize()
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		cleanupFuncs = append(cleanupFuncs, func() {
+			signal.Stop(sigCh)
+			close(done)
+		})
+	}
+
+	return func() {
+		for i := len(cleanupFuncs) - 1; i >= 0; i-- {
+			cleanupFuncs[i]()
+		}
+	}, nil
+}
+
+func isTerminal(file *os.File) bool {
+	_, err := unix.IoctlGetTermios(int(file.Fd()), ioctlGetTermios)
+	return err == nil
 }
 
 // Logs returns a ReadCloser that streams the container's combined stdout/stderr.
@@ -566,10 +716,6 @@ func parseMount(raw string) *mount.Mount {
 		target = fields["destination"]
 	}
 
-	if source == "" || target == "" {
-		return nil
-	}
-
 	mt := mount.TypeBind
 	if t, ok := fields["type"]; ok {
 		switch t {
@@ -580,6 +726,10 @@ func parseMount(raw string) *mount.Mount {
 		case "tmpfs":
 			mt = mount.TypeTmpfs
 		}
+	}
+
+	if target == "" || (source == "" && mt != mount.TypeTmpfs) {
+		return nil
 	}
 
 	_, readOnly := fields["readonly"]
@@ -602,8 +752,29 @@ func parseMount(raw string) *mount.Mount {
 			}
 		}
 	}
+	if mt == mount.TypeTmpfs {
+		if opts := parseTmpfsOptions(fields); opts != nil {
+			m.TmpfsOptions = opts
+		}
+	}
 
 	return m
+}
+
+func parseTmpfsOptions(fields map[string]string) *mount.TmpfsOptions {
+	var opts mount.TmpfsOptions
+	hasOpts := false
+
+	if mode, ok := fields["tmpfs-mode"]; ok && mode != "" {
+		if parsed, err := strconv.ParseUint(mode, 0, 32); err == nil {
+			opts.Mode = os.FileMode(parsed)
+			hasOpts = true
+		}
+	}
+	if !hasOpts {
+		return nil
+	}
+	return &opts
 }
 
 // parsePropagation maps a propagation string to a mount.Propagation constant.

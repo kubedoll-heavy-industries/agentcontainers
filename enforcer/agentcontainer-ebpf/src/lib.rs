@@ -19,6 +19,7 @@
 mod lsm;
 mod maps;
 mod network;
+mod process;
 
 // Panic handler required for no_std.
 #[panic_handler]

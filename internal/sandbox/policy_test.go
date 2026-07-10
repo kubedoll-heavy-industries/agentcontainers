@@ -24,6 +24,19 @@ func TestTranslatePolicy(t *testing.T) {
 			wantBypass:   []string{"localhost", "127.0.0.1", "::1"},
 		},
 		{
+			name: "explicit empty egress returns full deny",
+			capabilities: &config.Capabilities{
+				Network: &config.NetworkCaps{
+					Egress: []config.EgressRule{},
+					Deny:   []string{},
+				},
+			},
+			wantPolicy: "DENY",
+			wantAllow:  nil,
+			wantBlock:  []string{"169.254.169.254/32"},
+			wantBypass: []string{"localhost", "127.0.0.1", "::1"},
+		},
+		{
 			name: "domains become allow_hosts with :443",
 			capabilities: &config.Capabilities{
 				Network: &config.NetworkCaps{
