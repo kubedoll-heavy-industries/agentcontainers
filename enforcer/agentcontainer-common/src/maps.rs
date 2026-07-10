@@ -169,7 +169,6 @@ pub struct CgroupStats {
     pub denyset_blocked: u64,
 }
 
-
 // --- Cgroup enforcement flags (values stored in ENFORCED_CGROUPS) ---
 
 /// The cgroup is enforced (registered) — network + filesystem hooks apply.

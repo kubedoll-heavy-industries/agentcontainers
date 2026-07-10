@@ -986,7 +986,6 @@ mod linux {
                 }
             }
 
-            
             // Opt-in exec enforcement: set EXEC_ENFORCED only when allowlist non-empty.
             {
                 let map_data = bpf
@@ -1002,7 +1001,7 @@ mod linux {
                 emap.insert(cgroup_id, new, 0)?;
             }
 
-Ok(())
+            Ok(())
         }
 
         async fn apply_credential(

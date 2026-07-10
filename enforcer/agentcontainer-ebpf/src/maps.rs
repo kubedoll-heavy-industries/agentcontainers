@@ -72,7 +72,6 @@ pub fn enforced_cgroup_for_current() -> Option<u64> {
 #[map]
 pub static KERNEL_OFFSETS: Array<KernelOffsets> = Array::with_max_entries(1, 0);
 
-
 // --- Network maps ---
 
 /// Per-cgroup IPv4 CIDRs that are permitted (LPM trie longest prefix match).
