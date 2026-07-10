@@ -128,7 +128,7 @@ impl Enforcer for EnforcerService {
 
         let handle = self
             .manager
-            .register(&req.container_id, &req.cgroup_path)
+            .register(&req.container_id, &req.cgroup_path, req.init_pid)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

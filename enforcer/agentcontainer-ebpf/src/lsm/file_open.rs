@@ -227,33 +227,35 @@ unsafe fn bpf_probe_read_kernel_buf(src: *const u8, dst: &mut [u8]) -> Result<()
 pub fn ac_file_open(ctx: LsmContext) -> i32 {
     match try_file_open(&ctx) {
         Ok(ret) => ret,
-        Err(_) => LSM_ALLOW, // On error, fail open (same as C implementation)
+        // Fail-closed for subjects we already confirmed are under enforcement:
+        // try_file_open only returns Err after cgroup/PID sticky membership is
+        // established. Unenforced host tasks never reach those fallible paths
+        // (they return Ok(LSM_ALLOW) at the scoping gate).
+        Err(_) => LSM_DENY,
     }
 }
 
 #[inline(always)]
 fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
-    // 0. Cgroup scoping: only enforce for processes in target containers.
+    // 0. Cgroup / process-tree scoping: only enforce for agent-container subjects.
     //    LSM hooks are system-wide; skip all non-container processes.
-    // Subtree match: a task moved into a descendant of an enforced cgroup stays
-    // governed by that ancestor (its inode maps/stats), closing the child-cgroup
-    // escape. `cgid` is the enforced ancestor's id.
+    //    `cgid` is the governing enforced cgroup (ancestor or sticky).
     let cgid = match crate::maps::enforced_cgroup_for_current() {
         Some(id) => id,
         None => return Ok(LSM_ALLOW),
     };
 
-    // BTF-resolved field offsets. Absent means userspace failed to populate them;
-    // file_open's error policy is fail-open (matches the `Err` arm below).
+    // BTF-resolved field offsets. Absent means userspace failed to populate them.
+    // For an enforced subject that is fail-closed: cannot verify → deny.
     let offs = match KERNEL_OFFSETS.get(0) {
         Some(o) => o,
-        None => return Ok(LSM_ALLOW),
+        None => return Ok(LSM_DENY),
     };
 
     // Get the file pointer from the LSM hook argument.
     let file_ptr: *const u8 = unsafe { ctx.arg::<*const u8>(0) };
     if file_ptr.is_null() {
-        return Ok(LSM_ALLOW);
+        return Ok(LSM_DENY);
     }
 
     // 1. Check for /proc/*/environ -- always block to protect credentials.
@@ -267,11 +269,12 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     }
 
     // Read the inode via file->f_inode (stable since v3.9 — no dentry walk).
+    // Unverifiable identity for an enforced subject is fail-closed.
     let inode_ptr: *const u8 = unsafe { read_at(file_ptr, offs.file_f_inode)? };
     if inode_ptr.is_null() {
-        bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
-        bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
-        return Ok(LSM_ALLOW);
+        bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
+        bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
+        return Ok(LSM_DENY);
     }
 
     // Read inode number.
@@ -283,9 +286,9 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // Read the superblock to get the device number.
     let sb_ptr: *const u8 = unsafe { read_at(inode_ptr, offs.inode_i_sb)? };
     if sb_ptr.is_null() {
-        bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
-        bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
-        return Ok(LSM_ALLOW);
+        bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
+        bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
+        return Ok(LSM_DENY);
     }
 
     let s_dev: u32 = unsafe { read_at(sb_ptr, offs.sb_s_dev)? };
