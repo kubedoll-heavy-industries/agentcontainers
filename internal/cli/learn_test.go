@@ -105,7 +105,7 @@ func TestExecObservation_EmptyProfile(t *testing.T) {
 	obs := newExecObservation()
 	profile := obs.buildProfile()
 
-	if profile.Profiles != nil && len(profile.Profiles) != 0 {
+	if len(profile.Profiles) != 0 {
 		t.Errorf("expected empty profiles, got %d", len(profile.Profiles))
 	}
 
