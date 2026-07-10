@@ -21,7 +21,7 @@ agentcontainer-common = { path = "agentcontainer-common" }
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["tls-ring"] }
 rcgen = "0.13"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 prost = "0.14"
 tracing = "0.1"
