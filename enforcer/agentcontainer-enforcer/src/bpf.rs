@@ -162,6 +162,33 @@ mod linux {
         /// In-memory tracking of which cgroup IDs have been registered,
         /// so we can clean up all related map entries on unregister.
         container_cgroups: RwLock<HashMap<String, u64>>,
+
+        /// Set on drop to tell the event-reader thread to stop. The readers own
+        /// their ring buffers (taken out of the `Ebpf`), so this is not needed to
+        /// avoid a use-after-free; joining the thread on drop (see `Drop`) stops
+        /// it cleanly and releases the ring-buffer fds instead of leaking a
+        /// detached thread per manager (the test suite creates many).
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+        /// Handle to the event-reader OS thread, joined on drop. `None` only
+        /// transiently during construction.
+        reader_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for BpfPolicyManager {
+        fn drop(&mut self) {
+            // Stop the ring-buffer reader and WAIT for the thread to exit before
+            // the `Ebpf` (and the maps the readers use) is dropped. The `Drop`
+            // body runs before any field is dropped, so `programs` is still alive
+            // while we join. Without this, a dropped manager frees the BPF maps
+            // while the detached reader is still draining them — the source of the
+            // exit-time SIGSEGV/SIGABRT the test suite hit.
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.reader_thread.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     impl BpfPolicyManager {
@@ -196,16 +223,28 @@ mod linux {
 
             let registry = ContainerRegistry::new();
             let event_bus = EventBus::new();
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Take the event ring-buffer maps OUT of the `Ebpf` and hand OWNED
+            // RingBufs to the reader thread. The reader therefore never holds the
+            // `programs` lock (a leaked guard would block every map operation) and
+            // never borrows through `programs` (so relocating this struct is fine).
+            // `Drop` stops and joins the reader before `programs` is freed.
+            let reader_thread = Self::spawn_event_readers(
+                &mut bpf,
+                event_bus.clone(),
+                registry.clone(),
+                shutdown.clone(),
+            );
 
             let mgr = Self {
                 programs: std::sync::Mutex::new(bpf),
                 registry,
                 event_bus,
                 container_cgroups: RwLock::new(HashMap::new()),
+                shutdown,
+                reader_thread: Some(reader_thread),
             };
-
-            // Spawn background ring buffer readers for all event sources.
-            mgr.spawn_event_readers();
 
             Ok(mgr)
         }
@@ -398,19 +437,43 @@ mod linux {
         /// ring buffer is closed (i.e. the BPF programs are unloaded). Events
         /// are parsed into [`EnforcementEvent`]s and fanned out via the
         /// [`EventBus`] to all gRPC stream subscribers.
-        fn spawn_event_readers(&self) {
-            // Spawn a dedicated OS thread that holds the BPF programs lock and
-            // runs all ring buffer readers. We pass a raw pointer to self.programs
-            // because the Mutex<Ebpf> is not Arc-wrapped. This is safe because
-            // BpfPolicyManager lives for the process lifetime (created at startup,
-            // never dropped).
-            let programs_ptr = &self.programs as *const std::sync::Mutex<Ebpf>;
-            // SAFETY: BpfPolicyManager is created once at startup and lives until
-            // process exit. The thread we spawn accesses programs through this
-            // pointer for its entire lifetime.
-            let programs: &'static std::sync::Mutex<Ebpf> = unsafe { &*programs_ptr };
-            let bus = self.event_bus.clone();
-            let registry = self.registry.clone();
+        /// Spawn the background ring-buffer reader thread.
+        ///
+        /// Each event ring buffer is taken OUT of the `Ebpf` (via `take_map`) as an
+        /// OWNED `RingBuf<MapData>` and handed to the reader by value. The reader
+        /// therefore never locks `programs` (the previous design leaked a
+        /// `MutexGuard` for the process lifetime, which would deadlock every other
+        /// map operation) and never borrows through `programs` via a raw pointer
+        /// (so the manager is free to move or drop). The returned `JoinHandle` is
+        /// joined in `Drop` after `shutdown` is set.
+        fn spawn_event_readers(
+            bpf: &mut Ebpf,
+            bus: EventBus,
+            registry: ContainerRegistry,
+            shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> std::thread::JoinHandle<()> {
+            // take_map removes the map from the `Ebpf`; nothing else consumes these
+            // event ring buffers (policy operations use other maps), so this is safe.
+            fn take_ring(bpf: &mut Ebpf, name: &str) -> Option<RingBuf<aya::maps::MapData>> {
+                match bpf.take_map(name) {
+                    Some(map) => match RingBuf::try_from(map) {
+                        Ok(rb) => Some(rb),
+                        Err(e) => {
+                            warn!(name, error = %e, "map is not a ring buffer — reader skipped");
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            }
+            let net = take_ring(bpf, "NET_EVENTS");
+            let dns = take_ring(bpf, "DNS_EVENTS");
+            let fs = take_ring(bpf, "FS_EVENTS");
+            let proc = take_ring(bpf, "PROC_EVENTS");
+            let cred = take_ring(bpf, "CRED_EVENTS");
+            let bind = take_ring(bpf, "BIND_EVENTS");
+            let rshell = take_ring(bpf, "REVERSE_SHELL_EVENTS");
+            let memfd = take_ring(bpf, "MEMFD_EVENTS");
 
             std::thread::Builder::new()
                 .name("event-readers".into())
@@ -422,81 +485,81 @@ mod linux {
 
                     let local = tokio::task::LocalSet::new();
                     local.block_on(&rt, async {
-                        // Leak the MutexGuard — held for the process lifetime.
-                        // Ring buffer readers need 'static refs to MapData inside.
-                        let bpf = Box::leak(Box::new(programs.lock().unwrap()));
                         let mut handles = Vec::new();
 
                         macro_rules! spawn_reader {
-                            ($map_name:expr, $event_type:ty, $parse_fn:expr) => {
-                                if let Some(map_data) = bpf.map($map_name) {
-                                    if let Ok(ring_buf) = RingBuf::try_from(map_data) {
-                                        let b = bus.clone();
-                                        let r = registry.clone();
-                                        handles.push(tokio::task::spawn_local(async move {
-                                            Self::run_ring_buf_reader(
-                                                ring_buf,
-                                                b,
-                                                r,
-                                                |data, cid| {
-                                                    if data.len()
-                                                        >= std::mem::size_of::<$event_type>()
-                                                    {
-                                                        let raw: $event_type = unsafe {
-                                                            std::ptr::read_unaligned(
-                                                                data.as_ptr() as *const _
-                                                            )
-                                                        };
-                                                        Some($parse_fn(&raw, cid))
-                                                    } else {
-                                                        None
-                                                    }
-                                                },
-                                            )
-                                            .await;
-                                        }));
-                                        info!("{} ring buffer reader started", $map_name);
-                                    }
+                            ($ring:expr, $name:expr, $event_type:ty, $parse_fn:expr) => {
+                                if let Some(ring_buf) = $ring {
+                                    let b = bus.clone();
+                                    let r = registry.clone();
+                                    let sd = shutdown.clone();
+                                    handles.push(tokio::task::spawn_local(async move {
+                                        Self::run_ring_buf_reader(
+                                            ring_buf,
+                                            b,
+                                            r,
+                                            sd,
+                                            |data, cid| {
+                                                if data.len()
+                                                    >= std::mem::size_of::<$event_type>()
+                                                {
+                                                    let raw: $event_type = unsafe {
+                                                        std::ptr::read_unaligned(
+                                                            data.as_ptr() as *const _,
+                                                        )
+                                                    };
+                                                    Some($parse_fn(&raw, cid))
+                                                } else {
+                                                    None
+                                                }
+                                            },
+                                        )
+                                        .await;
+                                    }));
+                                    info!("{} ring buffer reader started", $name);
                                 }
                             };
                         }
 
-                        spawn_reader!("NET_EVENTS", bpf_events::NetworkEvent, parse_network_event);
-                        spawn_reader!("DNS_EVENTS", bpf_events::DnsEvent, parse_dns_event);
-                        spawn_reader!("FS_EVENTS", bpf_events::FsEvent, parse_fs_event);
-                        spawn_reader!("PROC_EVENTS", bpf_events::ExecEvent, parse_exec_event);
-                        spawn_reader!("CRED_EVENTS", bpf_events::CredEvent, parse_cred_event);
-                        spawn_reader!("BIND_EVENTS", bpf_events::BindEvent, parse_bind_event);
+                        spawn_reader!(net, "NET_EVENTS", bpf_events::NetworkEvent, parse_network_event);
+                        spawn_reader!(dns, "DNS_EVENTS", bpf_events::DnsEvent, parse_dns_event);
+                        spawn_reader!(fs, "FS_EVENTS", bpf_events::FsEvent, parse_fs_event);
+                        spawn_reader!(proc, "PROC_EVENTS", bpf_events::ExecEvent, parse_exec_event);
+                        spawn_reader!(cred, "CRED_EVENTS", bpf_events::CredEvent, parse_cred_event);
+                        spawn_reader!(bind, "BIND_EVENTS", bpf_events::BindEvent, parse_bind_event);
                         spawn_reader!(
+                            rshell,
                             "REVERSE_SHELL_EVENTS",
                             bpf_events::ReverseShellEvent,
                             parse_reverse_shell_event
                         );
-                        spawn_reader!("MEMFD_EVENTS", MemfdEvent, parse_memfd_event);
+                        spawn_reader!(memfd, "MEMFD_EVENTS", MemfdEvent, parse_memfd_event);
 
                         for h in handles {
                             let _ = h.await;
                         }
                     });
                 })
-                .expect("spawn event reader thread");
+                .expect("spawn event reader thread")
         }
 
         /// Generic ring buffer drain loop.
         ///
-        /// Reads events from the ring buffer, resolves the `cgroup_id` field in the
-        /// raw data to a container ID via the [`ContainerRegistry`], calls `parse` to
-        /// produce an [`EnforcementEvent`], and publishes it to the [`EventBus`].
+        /// Reads events from an OWNED ring buffer, resolves the event PID to a
+        /// container ID via the [`ContainerRegistry`], calls `parse` to produce an
+        /// [`EnforcementEvent`], and publishes it to the [`EventBus`].
         ///
         /// `parse` receives the raw byte slice and the resolved container ID string.
         /// It returns `None` if the data is malformed or should be skipped.
         ///
-        /// The loop terminates when the ring buffer returns no items (i.e. the BPF
-        /// programs have been unloaded) — this is expected during normal shutdown.
+        /// The loop returns when `shutdown` is observed (manager drop) or the ring
+        /// buffer fd errors; it wakes at least every 200ms so an idle reader sees
+        /// the shutdown flag promptly at teardown.
         async fn run_ring_buf_reader<F>(
-            mut ring_buf: RingBuf<&aya::maps::MapData>,
+            mut ring_buf: RingBuf<aya::maps::MapData>,
             bus: EventBus,
             registry: ContainerRegistry,
+            shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
             parse: F,
         ) where
             F: Fn(&[u8], &str) -> Option<crate::policy::EnforcementEvent> + Send + 'static,
@@ -520,32 +583,51 @@ mod linux {
             };
 
             loop {
-                // Wait until the ring buffer has data.
-                let mut guard = match async_fd.readable().await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        warn!(error = %e, "ring buffer readable() error, stopping reader");
-                        break;
-                    }
-                };
+                // Wait for data, but wake periodically so an otherwise-idle reader
+                // observes the shutdown flag promptly at teardown.
+                tokio::select! {
+                    guard = async_fd.readable() => {
+                        let mut guard = match guard {
+                            Ok(g) => g,
+                            Err(e) => {
+                                warn!(error = %e, "ring buffer readable() error, stopping reader");
+                                break;
+                            }
+                        };
 
-                // Drain all available records.
-                while let Some(item) = ring_buf.next() {
-                    let data: &[u8] = &item;
-                    let container_id = match read_event_pid(data) {
-                        Some(pid) => Self::resolve_container_id_for_pid(&registry, pid)
-                            .await
-                            .unwrap_or_default(),
-                        None => String::new(),
-                    };
+                        // Drain all available records. Re-check `shutdown` each
+                        // iteration: under a continuous event flood the ring
+                        // buffer never empties, so without this the drain loop
+                        // could starve the stop signal and `Drop`'s join would
+                        // hang instead of tearing down.
+                        while let Some(item) = ring_buf.next() {
+                            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let data: &[u8] = &item;
+                            let container_id = match read_event_pid(data) {
+                                Some(pid) => Self::resolve_container_id_for_pid(&registry, pid)
+                                    .await
+                                    .unwrap_or_default(),
+                                None => String::new(),
+                            };
 
-                    if let Some(event) = parse(data, &container_id) {
-                        bus.publish(event);
+                            if let Some(event) = parse(data, &container_id) {
+                                bus.publish(event);
+                            }
+                        }
+
+                        guard.clear_ready();
                     }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
                 }
 
-                guard.clear_ready();
                 let _ = online_cpus(); // suppress unused import warning
+
+                // Manager is dropping: stop before its `Ebpf` is freed.
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
             }
         }
 
