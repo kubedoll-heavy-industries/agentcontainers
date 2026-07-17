@@ -35,8 +35,8 @@ siphasher = { version = "1", default-features = false }
 tonic-health = "0.14"
 serde_json = "1"
 # WASM Component hosting
-wasmtime = { version = "42", features = ["component-model", "cranelift", "runtime", "parallel-compilation"] }
-wasmtime-wasi = "42"
+wasmtime = { version = "44", features = ["component-model", "cranelift", "runtime", "parallel-compilation"] }
+wasmtime-wasi = "44"
 # OpenTelemetry + OpenInference
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
